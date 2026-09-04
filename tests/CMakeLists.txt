@@ -303,6 +303,12 @@ llama_build_and_test(test-model-resolution.cpp)
 llama_build_and_test(test-kv-ssd-user-isolation.cpp)
 llama_build_and_test(test-moe-residency-routing.cpp)
 target_include_directories(test-moe-residency-routing PRIVATE ${PROJECT_SOURCE_DIR}/src)
+# The residency policy is intentionally an internal C++ component, so its
+# symbols are not part of the Windows shared-library export surface. Compile
+# the implementation into this white-box unit test so it remains linkable on
+# Windows as well as Unix-like platforms.
+target_sources(test-moe-residency-routing PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/llama-moe-residency.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
