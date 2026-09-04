@@ -56,7 +56,16 @@ server_context_page_manager::server_context_page_manager(
 }
 
 void server_context_page_manager::set_no_fsync(bool no_fsync) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     config_.no_fsync = no_fsync;
+    for (auto& [conv, cache] : conv_caches_) {
+        std::lock_guard<std::mutex> cache_lock(cache->mutex);
+        cache->config.no_fsync = no_fsync;
+    }
+    for (auto& [key, cache] : user_caches_) {
+        std::lock_guard<std::mutex> cache_lock(cache->mutex);
+        cache->config.no_fsync = no_fsync;
+    }
 }
 
 server_context_page_manager::~server_context_page_manager() {
@@ -66,6 +75,8 @@ server_context_page_manager::~server_context_page_manager() {
 void server_context_page_manager::set_model_info(const struct llama_model* model,
                                                    int cache_type_k, int cache_type_v) {
     if (!model) return;
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
 
     char desc_buf[2048];
     int desc_len = llama_model_desc(model, desc_buf, sizeof(desc_buf));
@@ -112,6 +123,9 @@ void server_context_page_manager::set_model_info(const struct llama_model* model
     for (auto& [conv, wrapper] : conv_wrappers_) {
         wrapper->set_compat_hash(h);
     }
+    for (auto& [key, wrapper] : user_wrappers_) {
+        wrapper->set_compat_hash(h);
+    }
 
     LOG_INF("SSD cache: model compat_hash %016lx (arch dims + type_k=%d type_v=%d)\n",
             (unsigned long)h, cache_type_k, cache_type_v);
@@ -126,7 +140,7 @@ server_ssd_cache* server_context_page_manager::get_or_create_cache(uint64_t conv
     }
 
     // Evict oldest conversation if at max
-    if ((int)conv_caches_.size() >= max_conversations) {
+    if (max_conversations > 0 && (int)conv_caches_.size() >= max_conversations) {
         uint64_t oldest_conv = 0;
         time_t oldest_mtime = 0;
 
@@ -157,13 +171,16 @@ server_ssd_cache* server_context_page_manager::get_or_create_cache(uint64_t conv
             snprintf(hex, sizeof(hex), "%016lx", (unsigned long)oldest_conv);
             fs::path dir = fs::path(ssd_base_path_) / hex;
 
-            for (const auto& entry : fs::directory_iterator(dir)) {
-                fs::remove(entry.path());
+            std::error_code ec;
+            fs::remove_all(dir, ec);
+            if (ec) {
+                LOG_WRN("SSD cache: failed to remove conversation %016lx: %s\n",
+                        (unsigned long)oldest_conv, ec.message().c_str());
             }
-            fs::remove(dir);
 
             conv_wrappers_.erase(oldest_conv);
             conv_caches_.erase(oldest_conv);
+            purge_cache_checkpoints(false, oldest_conv);
         }
     }
 
@@ -200,6 +217,28 @@ void server_context_page_manager::evict_slot_internal(uint32_t slot_id) {
     checkpoints_.erase(it);
 }
 
+void server_context_page_manager::purge_cache_checkpoints(bool user_scoped, uint64_t cache_key) {
+    for (auto it = checkpoints_.begin(); it != checkpoints_.end(); ) {
+        if (it->second.user_scoped == user_scoped && it->second.cache_key == cache_key) {
+            it = checkpoints_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+server_ssd_cache* server_context_page_manager::checkpoint_wrapper(const stored_checkpoint& checkpoint) {
+    auto& wrappers = checkpoint.user_scoped ? user_wrappers_ : conv_wrappers_;
+    auto it = wrappers.find(checkpoint.cache_key);
+    return it == wrappers.end() ? nullptr : it->second.get();
+}
+
+kv_ssd_cache* server_context_page_manager::checkpoint_cache(const stored_checkpoint& checkpoint) {
+    auto& caches = checkpoint.user_scoped ? user_caches_ : conv_caches_;
+    auto it = caches.find(checkpoint.cache_key);
+    return it == caches.end() ? nullptr : it->second.get();
+}
+
 bool server_context_page_manager::store_checkpoint(
     uint32_t slot_id,
     struct llama_context* ctx,
@@ -232,7 +271,9 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
     if (!sc) return false;
 
     // Evict if needed
-    if (checkpoints_.size() >= max_cross_slot_checkpoints_) {
+    if (checkpoints_.find(slot_id) == checkpoints_.end() &&
+        max_cross_slot_checkpoints_ > 0 &&
+        checkpoints_.size() >= max_cross_slot_checkpoints_) {
         auto it = std::min_element(checkpoints_.begin(), checkpoints_.end(),
             [](const auto& a, const auto& b) { return a.second.last_access < b.second.last_access; });
         if (it != checkpoints_.end()) evict_slot_internal(it->first);
@@ -251,11 +292,13 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
     sc2.pos_max = ckpt.pos_max;
     sc2.last_access = get_timestamp_ms();
     sc2.access_count = 0;
+    sc2.user_scoped = !user_id.empty();
+    sc2.cache_key = sc2.user_scoped ? sha256_namespace_key(user_id) : conv_hash;
     if (tokens && tokens_size > 0) {
         sc2.tokens.assign(tokens, tokens + std::min(tokens_size, (size_t)256));
     }
 
-    checkpoints_.emplace(slot_id, std::move(sc2));
+    checkpoints_.insert_or_assign(slot_id, std::move(sc2));
 
     // Enforce global cold tier byte cap (--cache-ssd-cold-maxsize). Eviction
     // happens after the store so writes never fail due to the cap; the cost
@@ -281,18 +324,7 @@ bool server_context_page_manager::load_checkpoint(
     auto it = checkpoints_.find(slot_id);
     if (it == checkpoints_.end()) return false;
 
-    // Find which cache has this checkpoint
-    server_ssd_cache* sc = nullptr;
-    // We need to know which conversation cache stores this checkpoint.
-    // Since we removed conv_hash from checkpoint metadata, we iterate all caches.
-    for (auto& [conv, wrapper] : conv_wrappers_) {
-        const kv_ssd_checkpoint* meta = kv_ssd_get_meta(
-            conv_caches_[conv].get(), it->second.checkpoint_id);
-        if (meta) {
-            sc = wrapper.get();
-            break;
-        }
-    }
+    server_ssd_cache* sc = checkpoint_wrapper(it->second);
     if (!sc) return false;
 
     // Load from SSD cache, which will promote to hot tier
@@ -324,16 +356,23 @@ bool server_context_page_manager::load_checkpoint_by_id(
 ) {
     if (checkpoint_id == 0) return false;
 
-    // Find which cache has this checkpoint
-    server_ssd_cache* sc = nullptr;
-    for (auto& [conv, wrapper] : conv_wrappers_) {
-        const kv_ssd_checkpoint* meta = kv_ssd_get_meta(
-            conv_caches_[conv].get(), checkpoint_id);
-        if (meta) {
-            sc = wrapper.get();
-            break;
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+
+    // A bare checkpoint ID is only safe when the slot map identifies exactly
+    // one owner. IDs are allocated independently in every conversation cache,
+    // so scanning caches for a matching number can restore another user's
+    // state. Callers needing a historical checkpoint must carry its owner.
+    const stored_checkpoint* owner = nullptr;
+    for (const auto& [slot_id, checkpoint] : checkpoints_) {
+        if (checkpoint.checkpoint_id == checkpoint_id) {
+            if (owner && (owner->user_scoped != checkpoint.user_scoped ||
+                          owner->cache_key != checkpoint.cache_key)) {
+                return false;
+            }
+            owner = &checkpoint;
         }
     }
+    server_ssd_cache* sc = owner ? checkpoint_wrapper(*owner) : nullptr;
     if (!sc) return false;
 
     // Pass dest_seq_id for cross-slot restore safety
@@ -365,12 +404,17 @@ void server_context_page_manager::prefetch_for_slot(uint32_t slot_id, uint32_t /
 }
 
 void server_context_page_manager::on_turn_complete(uint32_t turn_id) {
-    // Notify all cache instances
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+
+    // Notify all cache instances. User-scoped caches need the same demotion
+    // and ring-buffer pruning as anonymous conversation caches.
     for (auto& [conv, wrapper] : conv_wrappers_) {
         wrapper->on_turn_complete(turn_id);
     }
+    for (auto& [key, wrapper] : user_wrappers_) {
+        wrapper->on_turn_complete(turn_id);
+    }
 
-    std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto& [slot_id, sc] : checkpoints_) {
         sc.turn_id = turn_id;
     }
@@ -387,8 +431,11 @@ bool server_context_page_manager::find_matching_checkpoint(
     uint64_t conv_hash,
     int32_t n_past,
     uint64_t max_n_tokens,
-    const std::string& user_id
+    const std::string& user_id,
+    bool allow_partial
 ) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+
     if (!user_id.empty()) {
         // user-scoped lookups never escape the user's own cache. cross-user
         // continuation matching is a privacy violation, so we skip it.
@@ -396,19 +443,9 @@ bool server_context_page_manager::find_matching_checkpoint(
         server_ssd_cache* sc = get_or_create_user_cache(user_id);
         if (!sc) return false;
 
-        uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past);
+        uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past,
+                                          nullptr, nullptr, allow_partial);
         if (ckpt_id == 0) { cache_misses_++; return false; }
-
-        for (const auto& [slot_id, cp] : checkpoints_) {
-            if (cp.checkpoint_id == ckpt_id) {
-                out_slot_id = slot_id;
-                out_pos_min = cp.pos_min;
-                out_pos_max = cp.pos_max;
-                out_n_tokens = cp.n_tokens;
-                cache_hits_++;
-                return true;
-            }
-        }
 
         kv_ssd_cache* raw = user_caches_[key].get();
         const kv_ssd_checkpoint* meta = kv_ssd_get_meta(raw, ckpt_id);
@@ -443,25 +480,15 @@ bool server_context_page_manager::find_matching_checkpoint(
     server_ssd_cache* sc = get_or_create_cache(effective_conv);
     if (!sc) return false;
 
-    uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past);
+    uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past,
+                                      nullptr, nullptr, allow_partial);
     if (ckpt_id == 0) {
         cache_misses_++;
         return false;
     }
 
-    // Look up in checkpoints_ map first
-    for (const auto& [slot_id, cp] : checkpoints_) {
-        if (cp.checkpoint_id == ckpt_id) {
-            out_slot_id = slot_id;
-            out_pos_min = cp.pos_min;
-            out_pos_max = cp.pos_max;
-            out_n_tokens = cp.n_tokens;
-            cache_hits_++;
-            return true;
-        }
-    }
-
-    // Look up in the cache's own metadata
+    // IDs are local to each conversation cache, so use the selected cache's
+    // own metadata instead of comparing bare IDs in the cross-cache slot map.
     kv_ssd_cache* raw = conv_caches_[effective_conv].get();
     const kv_ssd_checkpoint* meta = kv_ssd_get_meta(raw, ckpt_id);
     if (meta) {
@@ -495,8 +522,11 @@ bool server_context_page_manager::find_and_load_checkpoint(
     float* out_overlap,
     bool* out_is_continuation,
     bool* out_partial,
-    const std::string& user_id
+    const std::string& user_id,
+    bool allow_partial
 ) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+
     if (!user_id.empty()) {
         // user-scoped cold-start lookups never escape the user's own cache.
         // cross-user continuation matching is a privacy violation.
@@ -505,7 +535,8 @@ bool server_context_page_manager::find_and_load_checkpoint(
 
         int32_t match_lcp = 0;
         bool match_partial = false;
-        uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past, &match_lcp, &match_partial);
+        uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past,
+                                          &match_lcp, &match_partial, allow_partial);
         if (ckpt_id == 0) { cache_misses_++; return false; }
 
         // Prefetch the checkpoint file from SSD while we prepare to load it.
@@ -556,7 +587,8 @@ bool server_context_page_manager::find_and_load_checkpoint(
 
     int32_t match_lcp = 0;
     bool match_partial = false;
-    uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past, &match_lcp, &match_partial);
+    uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past,
+                                      &match_lcp, &match_partial, allow_partial);
     if (ckpt_id == 0) {
         cache_misses_++;
         return false;
@@ -604,14 +636,8 @@ bool server_context_page_manager::get_checkpoint_data(uint32_t slot_id, std::vec
     auto it = checkpoints_.find(slot_id);
     if (it == checkpoints_.end()) return false;
 
-    // Find which cache has this checkpoint
-    for (auto& [conv, cache] : conv_caches_) {
-        const kv_ssd_checkpoint* meta = kv_ssd_get_meta(cache.get(), it->second.checkpoint_id);
-        if (meta) {
-            return kv_ssd_load(cache.get(), it->second.checkpoint_id, out_data);
-        }
-    }
-    return false;
+    kv_ssd_cache* cache = checkpoint_cache(it->second);
+    return cache && kv_ssd_load(cache, it->second.checkpoint_id, out_data);
 }
 
 void server_context_page_manager::get_stats(
@@ -619,15 +645,28 @@ void server_context_page_manager::get_stats(
     size_t* total_checkpoints, size_t* max_checkpoints,
     uint64_t* hits, uint64_t* misses, float* hit_rate
 ) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+
     size_t hot_sum = 0, warm_sum = 0, cold_sum = 0, total_sum = 0;
-    for (const auto& [conv, cache] : conv_caches_) {
+    auto accumulate = [&](const auto& caches) {
+      for (const auto& [key, cache] : caches) {
         size_t h, w, c, t;
         kv_ssd_get_stats(cache.get(), &h, &w, &c, &t, nullptr, nullptr);
         hot_sum += h;
         warm_sum += w;
-        cold_sum += c;
         total_sum += t;
-    }
+        {
+            std::lock_guard<std::mutex> cache_lock(cache->mutex);
+            for (const auto& [id, checkpoint] : cache->index) {
+                if (checkpoint.tier == KV_TIER_COLD) {
+                    cold_sum += checkpoint.data_size + checkpoint.dft_data_size + checkpoint.spec_data_size;
+                }
+            }
+        }
+      }
+    };
+    accumulate(conv_caches_);
+    accumulate(user_caches_);
     if (hot_bytes) *hot_bytes = hot_sum;
     if (warm_bytes) *warm_bytes = warm_sum;
     if (cold_bytes) *cold_bytes = cold_sum;
@@ -655,10 +694,10 @@ server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const st
         return it->second.get();
     }
 
-    // Evict oldest user cache if at max. share the max_conversations cap
-    // with the anonymous bucket so the total SSD directory count stays
-    // bounded.
-    if ((int)user_caches_.size() >= max_conversations) {
+    // Evict the oldest user cache when the user namespace reaches its cap.
+    // Anonymous and user caches are independent namespaces; the global byte
+    // cap below bounds their combined storage.
+    if (max_conversations > 0 && (int)user_caches_.size() >= max_conversations) {
         uint64_t oldest = 0;
         time_t oldest_mtime = 0;
 
@@ -688,13 +727,16 @@ server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const st
             snprintf(hex, sizeof(hex), "%016lx", (unsigned long)oldest);
             fs::path dir = fs::path(ssd_base_path_) / "u" / hex;
 
-            for (const auto& entry : fs::directory_iterator(dir)) {
-                fs::remove(entry.path());
+            std::error_code ec;
+            fs::remove_all(dir, ec);
+            if (ec) {
+                LOG_WRN("SSD cache: failed to remove user %016lx: %s\n",
+                        (unsigned long)oldest, ec.message().c_str());
             }
-            fs::remove(dir);
 
             user_wrappers_.erase(oldest);
             user_caches_.erase(oldest);
+            purge_cache_checkpoints(true, oldest);
         }
     }
 
@@ -846,30 +888,10 @@ void server_context_page_manager::evict_conversations_for_size_locked() {
             conv_caches_.erase(c.key);
         }
 
-        // Drop any in-memory checkpoint entries that belonged to the evicted
-        // conversation. Without this, a slot whose checkpoint was just freed
-        // would still appear in checkpoints_ and trigger load failures.
-        for (auto it = checkpoints_.begin(); it != checkpoints_.end(); ) {
-            // The evicted conversation may have owned checkpoint IDs that are
-            // no longer in any remaining cache. Drop those slot entries so a
-            // subsequent load doesn't try to restore from freed disk state.
-            // The next store for that slot will recreate the entry cleanly.
-            uint64_t cid = it->second.checkpoint_id;
-            bool found = false;
-            for (const auto& [cv, cache] : conv_caches_) {
-                if (cache->index.count(cid)) { found = true; break; }
-            }
-            if (!found) {
-                for (const auto& [uk, cache] : user_caches_) {
-                    if (cache->index.count(cid)) { found = true; break; }
-                }
-            }
-            if (!found) {
-                it = checkpoints_.erase(it);
-            } else {
-                ++it;
-            }
-        }
+        // Checkpoint IDs are only unique inside one cache. Purge by the
+        // recorded namespace owner so an equal ID in another conversation
+        // cannot keep a stale slot entry alive.
+        purge_cache_checkpoints(c.is_user, c.key);
 
         total = (freed > total) ? 0 : total - freed;
         evicted++;

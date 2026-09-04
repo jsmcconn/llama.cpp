@@ -107,10 +107,10 @@ bool server_ssd_cache::load(uint64_t checkpoint_id,
 
 uint64_t server_ssd_cache::find_match(const llama_token* tokens, size_t tokens_size, uint32_t current_turn,
                                       uint64_t max_n_tokens, int32_t n_past,
-                                      int32_t* out_lcp, bool* out_partial) {
+                                      int32_t* out_lcp, bool* out_partial, bool allow_partial) {
     if (!cache_) return 0;
     return kv_ssd_find_match(cache_, (const uint32_t*)tokens, tokens_size, current_turn,
-                             max_n_tokens, n_past, out_lcp, out_partial);
+                             max_n_tokens, n_past, out_lcp, out_partial, allow_partial);
 }
 
 uint64_t server_ssd_cache::find_by_slot(uint32_t slot_id, uint64_t min_tokens, uint32_t current_turn) {

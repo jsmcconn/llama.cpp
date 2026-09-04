@@ -60,7 +60,8 @@ public:
                         uint64_t max_n_tokens = UINT64_MAX,
                         int32_t n_past = -1,
                         int32_t* out_lcp = nullptr,
-                        bool* out_partial = nullptr);
+                        bool* out_partial = nullptr,
+                        bool allow_partial = true);
 
     // Find best checkpoint for a slot.
     uint64_t find_by_slot(uint32_t slot_id, uint64_t min_tokens, uint32_t current_turn);

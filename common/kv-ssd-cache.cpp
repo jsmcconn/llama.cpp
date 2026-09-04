@@ -12,6 +12,7 @@
 #include <cinttypes>
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <climits>
 #include <filesystem>
 #include <fcntl.h>
@@ -506,7 +507,9 @@ static void ring_buffer_evict(kv_ssd_cache* c) {
         }
     }
     std::sort(cold_by_age.begin(), cold_by_age.end(),
-        [](const auto& a, const auto& b) { return a.second < b.second; });
+        [](const auto& a, const auto& b) {
+            return a.second != b.second ? a.second < b.second : a.first < b.first;
+        });
 
     int to_evict = (int)cold_count - max_cold;
     int evicted = 0;
@@ -1065,7 +1068,8 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
                            uint64_t max_n_tokens,
                            int32_t n_past,
                            int32_t* out_lcp,
-                           bool* out_partial)
+                           bool* out_partial,
+                           bool allow_partial)
 {
     (void)current_turn;  // unused - was for cross-conversation matching
     (void)n_past;        // unused - was for tiered search
@@ -1115,7 +1119,7 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
         if (hash_match && size_ok) {
             // Full match: apply standard max_n_tokens filter.
             if (max_n_tokens > 0 && ckpt.n_tokens > max_n_tokens) continue;
-        } else if (lcp >= (int32_t)KV_SSD_TOKEN_PREFIX_MAX) {
+        } else if (allow_partial && lcp >= (int32_t)KV_SSD_TOKEN_PREFIX_MAX) {
             // Partial LCP match: accept, caller caps to LCP.
             // max_n_tokens filter skipped — lcp <= tokens_size by construction.
         } else {
@@ -1296,15 +1300,25 @@ uint64_t kv_ssd_find_continuation(
 
     namespace fs = std::filesystem;
     fs::path base(base_path);
-    if (!fs::exists(base) || !fs::is_directory(base)) return 0;
+    std::error_code dir_ec;
+    if (!fs::is_directory(base, dir_ec) || dir_ec) return 0;
 
     uint64_t best_conv = 0;
     float best_score = 0.0f;
 
-    for (const auto& entry : fs::directory_iterator(base)) {
-        if (!entry.is_directory()) continue;
-        std::string dirname = entry.path().filename().string();
-        if (dirname[0] == '.') continue;
+    fs::directory_iterator entry_it(base, dir_ec);
+    const fs::directory_iterator end;
+    for (; !dir_ec && entry_it != end; entry_it.increment(dir_ec)) {
+        const auto& entry = *entry_it;
+        std::error_code entry_ec;
+        if (!entry.is_directory(entry_ec) || entry_ec) continue;
+        const std::string dirname = entry.path().filename().string();
+        if (dirname.size() != 16 ||
+            !std::all_of(dirname.begin(), dirname.end(), [](unsigned char c) {
+                return std::isxdigit(c) != 0;
+            })) {
+            continue;
+        }
 
         std::string conv_dir = entry.path().string();
 
@@ -1333,8 +1347,11 @@ uint64_t kv_ssd_find_continuation(
         // Scan for checkpoint with best prefix overlap
         float best_conv_score = 0.0f;
 
-        for (const auto& ckpt_entry : fs::directory_iterator(conv_dir)) {
-            std::string fname = ckpt_entry.path().filename().string();
+        std::error_code ckpt_ec;
+        fs::directory_iterator ckpt_it(entry.path(), ckpt_ec);
+        for (; !ckpt_ec && ckpt_it != end; ckpt_it.increment(ckpt_ec)) {
+            const auto& ckpt_entry = *ckpt_it;
+            const std::string fname = ckpt_entry.path().filename().string();
             if (fname.size() < 9) continue;
             if (fname.compare(0, 5, "ckpt-") != 0) continue;
             if (fname.compare(fname.size() - 4, 4, ".bin") != 0) continue;
@@ -1346,7 +1363,7 @@ uint64_t kv_ssd_find_continuation(
             kv_ssd_record rec;
             bool rok = pread_all(cfd, &rec, sizeof(rec), 0);
             close(cfd);
-            if (!rok || rec.magic != KV_SSD_MAGIC_REC) continue;
+            if (!rok || rec.magic != KV_SSD_MAGIC_REC || rec.version != KV_SSD_VERSION) continue;
 
             // Compute overlap with stored prefix
             size_t cmp_count = std::min(tokens_size, (size_t)rec.token_count);
@@ -1388,57 +1405,76 @@ uint64_t kv_ssd_find_continuation(
     return best_conv;
 }
 
-// Get maximum turn_id across all conversation directories.
+// Get maximum turn_id across all anonymous and user-scoped conversation
+// directories. User caches live one level lower under "u/"; omitting them
+// resets the server's turn counter after restart and distorts tier aging and
+// oldest-first eviction for the workloads that use stable user IDs.
 uint32_t kv_ssd_get_max_turn_id_global(const char* base_path) {
     if (!base_path) return 0;
 
     namespace fs = std::filesystem;
     fs::path base(base_path);
-    if (!fs::exists(base) || !fs::is_directory(base)) return 0;
+    std::error_code ec;
+    if (!fs::is_directory(base, ec) || ec) return 0;
 
     uint32_t max_turn = 0;
 
-    for (const auto& entry : fs::directory_iterator(base)) {
-        if (!entry.is_directory()) continue;
-        std::string dirname = entry.path().filename().string();
-        if (dirname[0] == '.') continue;
+    auto scan_namespace = [&](const fs::path& namespace_dir) {
+        std::error_code dir_ec;
+        if (!fs::is_directory(namespace_dir, dir_ec) || dir_ec) return;
 
-        std::string conv_dir = entry.path().string();
+        fs::directory_iterator entry_it(namespace_dir, dir_ec);
+        const fs::directory_iterator end;
+        for (; !dir_ec && entry_it != end; entry_it.increment(dir_ec)) {
+            const auto& entry = *entry_it;
+            std::error_code entry_ec;
+            if (!entry.is_directory(entry_ec) || entry_ec) continue;
+            const std::string dirname = entry.path().filename().string();
+            if (dirname.size() != 16 ||
+                !std::all_of(dirname.begin(), dirname.end(), [](unsigned char c) {
+                    return std::isxdigit(c) != 0;
+                })) {
+                continue;
+            }
 
-        // Parse conv_hash (validate 16-char hex name)
-        uint64_t conv_hash_test = 0;
-        if (sscanf(dirname.c_str(), "%016" SCNx64, &conv_hash_test) != 1) continue;
+            const std::string conv_dir = entry.path().string();
+            const std::string index_file = conv_dir + "/index.bin";
+            int fd = open(index_file.c_str(), O_RDONLY);
+            if (fd < 0) continue;
 
-        std::string index_file = conv_dir + "/index.bin";
-        int fd = open(index_file.c_str(), O_RDONLY);
-        if (fd < 0) continue;
+            kv_ssd_index_header hdr;
+            bool ok = pread_all(fd, &hdr, sizeof(hdr), 0);
+            close(fd);
+            if (!ok || hdr.magic != KV_SSD_MAGIC_INDEX || hdr.version != KV_SSD_VERSION) continue;
 
-        kv_ssd_index_header hdr;
-        bool ok = pread_all(fd, &hdr, sizeof(hdr), 0);
-        close(fd);
-        if (!ok || hdr.magic != KV_SSD_MAGIC_INDEX) continue;
+            std::error_code ckpt_ec;
+            fs::directory_iterator ckpt_it(entry.path(), ckpt_ec);
+            for (; !ckpt_ec && ckpt_it != end; ckpt_it.increment(ckpt_ec)) {
+                const auto& ckpt_entry = *ckpt_it;
+                const std::string fname = ckpt_entry.path().filename().string();
+                if (fname.size() < 9 ||
+                    fname.compare(0, 5, "ckpt-") != 0 ||
+                    fname.compare(fname.size() - 4, 4, ".bin") != 0) {
+                    continue;
+                }
 
-        // Quick scan of checkpoint files for max turn_created
-        for (const auto& ckpt_entry : fs::directory_iterator(conv_dir)) {
-            std::string fname = ckpt_entry.path().filename().string();
-            if (fname.size() < 9) continue;
-            if (fname.compare(0, 5, "ckpt-") != 0) continue;
-            if (fname.compare(fname.size() - 4, 4, ".bin") != 0) continue;
+                int cfd = open(ckpt_entry.path().c_str(), O_RDONLY);
+                if (cfd < 0) continue;
 
-            std::string ckpt_file = ckpt_entry.path().string();
-            int cfd = open(ckpt_file.c_str(), O_RDONLY);
-            if (cfd < 0) continue;
-
-            kv_ssd_record rec;
-            bool rok = pread_all(cfd, &rec, sizeof(rec), 0);
-            close(cfd);
-            if (rok && rec.magic == KV_SSD_MAGIC_REC &&
-                rec.version == KV_SSD_VERSION &&
-                rec.turn_created > max_turn) {
-                max_turn = rec.turn_created;
+                kv_ssd_record rec;
+                bool rok = pread_all(cfd, &rec, sizeof(rec), 0);
+                close(cfd);
+                if (rok && rec.magic == KV_SSD_MAGIC_REC &&
+                    rec.version == KV_SSD_VERSION &&
+                    rec.turn_created > max_turn) {
+                    max_turn = rec.turn_created;
+                }
             }
         }
-    }
+    };
+
+    scan_namespace(base);
+    scan_namespace(base / "u");
 
     return max_turn;
 }

@@ -24,6 +24,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -212,11 +213,41 @@ static void test_atomic_index_persistence() {
     fs::remove_all(base);
 }
 
+static void test_global_turn_scan_includes_user_namespace() {
+    const std::string base = make_temp_dir("turn-user");
+    const uint8_t data[] = { 0x11, 0x22, 0x33 };
+    const uint32_t tokens[] = { 1, 2, 3 };
+
+    kv_ssd_config cfg;
+    cfg.auto_size = false;
+    cfg.no_fsync = true;
+
+    kv_ssd_cache * anonymous = kv_ssd_init(base.c_str(), &cfg, 0x101ULL);
+    assert(anonymous != nullptr);
+    assert(kv_ssd_store(anonymous, 0, data, sizeof(data), 0, 2, 3, 42,
+                        tokens, 3, 0) != 0);
+    kv_ssd_free(anonymous);
+
+    kv_ssd_cache * user = kv_ssd_init(base.c_str(), &cfg, 0x202ULL, "u/");
+    assert(user != nullptr);
+    assert(kv_ssd_store(user, 0, data, sizeof(data), 0, 2, 3, 77,
+                        tokens, 3, 0) != 0);
+    kv_ssd_free(user);
+
+    fs::create_directories(fs::path(base) / "u" / "not-a-cache");
+    fs::create_directories(fs::path(base) / "0000000000000bad");
+    std::ofstream(fs::path(base) / "0000000000000bad" / "index.bin") << "corrupt";
+    assert(kv_ssd_get_max_turn_id_global(base.c_str()) == 77);
+    fs::remove_all(base);
+    assert(kv_ssd_get_max_turn_id_global(base.c_str()) == 0);
+}
+
 int main() {
     test_isolated_directories();
     test_no_cross_user_lookups();
     test_namespace_hash_stability();
     test_atomic_index_persistence();
+    test_global_turn_scan_includes_user_namespace();
     std::printf("kv-ssd-user-isolation: all tests passed\n");
     return 0;
 }

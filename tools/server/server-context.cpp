@@ -3002,10 +3002,27 @@ private:
                 slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
                 cur.pos_min, (float) cur.size() / 1024 / 1024);
 
-        // SSD-backed KV cache: store checkpoint on disk
+        // SSD-backed KV cache: store checkpoint on disk. A completion whose
+        // remaining prompt fits in one ubatch will create a deferred final
+        // checkpoint after its first sampled token. Persisting this near-end
+        // snapshot as well would synchronously serialize and write almost the
+        // same full target + draft state twice. Keep the mid-prompt checkpoint
+        // in RAM for recurrent rollback, and let the final checkpoint be the
+        // single durable snapshot for this turn.
+        //
         // Serialized SSD checkpoints contain text token IDs; media embeddings
         // and placeholders must be re-encoded by the multimodal path.
-        if (ssd_page_manager && !slot.prompt.tokens.has_media()) {
+        const int64_t checkpoint_n_tokens = cur.n_tokens;
+        const int64_t task_n_tokens = slot.task ? slot.task->n_tokens() : 0;
+        const int64_t remaining_tokens = task_n_tokens - checkpoint_n_tokens;
+        const bool final_checkpoint_will_cover =
+            slot.task &&
+            slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+            checkpoint_n_tokens >= 64 &&
+            remaining_tokens >= 0 &&
+            remaining_tokens <= llama_n_ubatch(ctx_tgt);
+
+        if (ssd_page_manager && !slot.prompt.tokens.has_media() && !final_checkpoint_will_cover) {
             const auto & prefix_tokens = slot.prompt.tokens;
             ssd_page_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur,
@@ -3013,6 +3030,11 @@ private:
                 prefix_tokens.get_tokens().size(),
                 ssd_turn_counter, slot.conv_hash,
                 slot.task ? slot.task->user_id : std::string());
+        } else if (ssd_page_manager && !slot.prompt.tokens.has_media() && final_checkpoint_will_cover) {
+            SLT_INF(slot,
+                    "SSD cache: keeping near-end mid-prompt checkpoint in RAM "
+                    "(%" PRId64 " tokens remain); deferred final will persist the turn\n",
+                    remaining_tokens);
         }
     }
 
@@ -4140,7 +4162,9 @@ private:
                                         slot.conv_hash, 0, (uint64_t)task_tokens.size(),
                                         &ssd_lcp, &ssd_overlap, &ssd_is_continuation,
                                         &ssd_partial,
-                                        slot.task->user_id)) {
+                                        slot.task->user_id,
+                                        ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                                            (!ctx_dft || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS))) {
                                     // Safety check: reject checkpoints that cover more tokens than
                                     // the current task. This can happen if a deferred final
                                     // checkpoint was created after the first generation token
@@ -4164,75 +4188,51 @@ private:
                                         ssd_n_tokens = 0;
                                     }
 
-                                    // Hybrid model LCP validation. Recurrent state is
-                                    // content-dependent - if the LCP is much smaller than
-                                    // the checkpoint's n_tokens, the recurrent state beyond
-                                    // the LCP is from a different conversation and will
-                                    // produce garbage logits (all -inf, sampler crash).
-                                    //
-                                    // Three cases:
-                                    //   1. lcp >= n_tokens: full coverage, recurrent state valid
-                                    //   2. lcp >= PREFIX_MAX (4096) AND overlap >= 99%:
-                                    //      same-conversation checkpoint with full prefix match
-                                    //   3. lcp < PREFIX_MAX: partial coverage, cap n_past to LCP
-                                    //
-                                    // For dense models the recurrent layer is replaced by full
-                                    // attention, so this gate is a no-op for them.
-                                    if (ssd_n_tokens > 0 && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS
-                                            && ssd_lcp > 0 && ssd_n_tokens > 0) {
-                                        const uint64_t validated_tokens = std::min(
-                                            ssd_n_tokens, (uint64_t)KV_SSD_TOKEN_PREFIX_MAX);
-                                        const float MIN_LCP_RATIO = 0.80f;
-                                        float lcp_ratio = (float)ssd_lcp / (float)validated_tokens;
-                                        // A partial LCP match (hash didn't match the full sequence)
-                                        // is never "full coverage" — the state beyond the LCP is
-                                        // from a different token sequence.
-                                        bool full_coverage = !ssd_partial && (
-                                            ssd_lcp >= (int32_t)ssd_n_tokens ||
-                                            (ssd_lcp >= (int32_t)KV_SSD_TOKEN_PREFIX_MAX
-                                             && ssd_overlap >= 0.99f));
-                                        if (!full_coverage && lcp_ratio < MIN_LCP_RATIO) {
-                                            SLT_WRN(slot, "cold-start: rejecting SSD checkpoint for hybrid model "
-                                                    "(lcp=%d < 80%% of validated=%lu/n_tokens=%lu, ratio=%.1f%%, overlap=%.1f%%)\n",
-                                                    ssd_lcp, (unsigned long)validated_tokens, (unsigned long)ssd_n_tokens,
-                                                    lcp_ratio * 100.0f, ssd_overlap * 100.0f);
-                                            // Clear the loaded state and reset
-                                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
-                                            n_past = 0;
-                                            slot.prompt.tokens.clear();
-                                            ssd_n_tokens = 0;
-                                        } else if (!full_coverage) {
-                                            // Partial coverage: cap n_past to LCP so only
-                                            // validated recurrent state is used.
-                                            SLT_INF(slot, "SSD hybrid model partial-coverage: "
-                                                    "lcp=%d ssd_n_tokens=%lu cap to LCP\n",
-                                                    ssd_lcp, (unsigned long)ssd_n_tokens);
-                                            llama_memory_seq_rm_attn_only(
-                                                llama_get_memory(ctx_tgt), slot.id, ssd_lcp, -1);
-                                            // Attention state is only valid up to LCP for hybrid models
-                                            n_past = ssd_lcp;
+                                    // A recurrent checkpoint is one content-dependent state at
+                                    // its full n_tokens boundary. Attention KV can be trimmed to
+                                    // an earlier LCP, but recurrent state cannot be rolled back to
+                                    // an arbitrary token after it has been deserialized. Therefore
+                                    // a hash-mismatched partial checkpoint is unsafe for hybrid
+                                    // models even when most of its prefix agrees. kv_ssd_find_match
+                                    // prefers a full-hash checkpoint over partial candidates, so reaching
+                                    // this branch means no safe boundary snapshot was available.
+                                    if (ssd_n_tokens > 0 && ssd_partial &&
+                                            (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                                             (ctx_dft && ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS))) {
+                                        SLT_WRN(slot,
+                                                "cold-start: rejecting partial SSD checkpoint for hybrid model "
+                                                "(lcp=%d n_tokens=%lu); recurrent state cannot be trimmed\n",
+                                                ssd_lcp, (unsigned long)ssd_n_tokens);
+                                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                                        if (ctx_dft) {
+                                            llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, -1, -1);
                                         }
+                                        n_past = 0;
+                                        slot.prompt.tokens.clear();
+                                        ssd_n_tokens = 0;
                                     }
 
-                                    // Partial LCP match (dense or hybrid): the restored state
-                                    // is only valid up to the LCP position. Strip stale
-                                    // attention KV beyond ssd_lcp and cap n_past.
-                                    // The hybrid model block above already does this for
-                                    // recurrent models; dense (non-SWA) models fall through
-                                    // here because seq_rm_attn_only == seq_rm for them.
+                                    // Partial LCP matches are usable only for ordinary
+                                    // attention models. The hybrid branch above rejects and
+                                    // clears them; dense models can safely strip stale KV
+                                    // beyond ssd_lcp and resume from the verified prefix.
                                     if (ssd_partial && ssd_lcp > 0 && (uint64_t)ssd_lcp < ssd_n_tokens) {
                                         SLT_INF(slot, "SSD cache partial-LCP restore: "
                                                 "lcp=%d ssd_n_tokens=%lu stripping post-LCP attention KV\n",
                                                 ssd_lcp, (unsigned long)ssd_n_tokens);
                                         llama_memory_seq_rm_attn_only(
                                             llama_get_memory(ctx_tgt), slot.id, ssd_lcp, -1);
+                                        if (ctx_dft) {
+                                            llama_memory_seq_rm_attn_only(
+                                                llama_get_memory(ctx_dft.get()), slot.id, ssd_lcp, -1);
+                                        }
                                         n_past = ssd_lcp;
                                     }
 
                                     if (ssd_n_tokens > 0) {
                                     // Push checkpoint's token count.
                                     // ssd_lcp from find_match is capped at
-                                    // KV_SSD_TOKEN_PREFIX_MAX (4096), but
+                                    // KV_SSD_TOKEN_PREFIX_MAX, but
                                     // same-conversation checkpoints match
                                     // for all n_tokens. Use ssd_n_tokens
                                     // directly for full coverage.

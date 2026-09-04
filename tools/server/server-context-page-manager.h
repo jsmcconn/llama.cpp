@@ -39,6 +39,8 @@ public:
         uint64_t last_access = 0;          // Timestamp
         uint32_t access_count = 0;         // Access count
         std::vector<llama_token> tokens;  // Token sequence for matching
+        uint64_t cache_key = 0;            // Conversation hash or hashed user namespace
+        bool user_scoped = false;          // Selects user_caches_ when true
     };
 
     server_context_page_manager(
@@ -123,7 +125,8 @@ public:
         uint64_t conv_hash = 0,
         int32_t n_past = -1,
         uint64_t max_n_tokens = UINT64_MAX,
-        const std::string& user_id = std::string()
+        const std::string& user_id = std::string(),
+        bool allow_partial = true
     );
 
     // Find matching checkpoint by token prefix and restore to VRAM (cross-session restart)
@@ -149,7 +152,8 @@ public:
         float* out_overlap = nullptr,
         bool* out_is_continuation = nullptr,
         bool* out_partial = nullptr,
-        const std::string& user_id = std::string()
+        const std::string& user_id = std::string(),
+        bool allow_partial = true
     );
 
    // Evict all checkpoints for a specific slot
@@ -196,6 +200,9 @@ public:
 
 private:
     void evict_slot_internal(uint32_t slot_id);
+    void purge_cache_checkpoints(bool user_scoped, uint64_t cache_key);
+    server_ssd_cache* checkpoint_wrapper(const stored_checkpoint& checkpoint);
+    kv_ssd_cache* checkpoint_cache(const stored_checkpoint& checkpoint);
     uint64_t get_timestamp_ms() const;
 
     // Get or create cache for a conversation hash
@@ -226,8 +233,8 @@ private:
     std::unordered_map<uint64_t, std::unique_ptr<server_ssd_cache>> conv_wrappers_;
 
     // User-scoped caches. Parallel to conv_caches_ but isolated on disk
-    // under the "u/" namespace. Keyed by fnv1a(user_id) so the on-disk
-    // layout is the same hash format as anonymous caches.
+    // under the "u/" namespace. Keyed by a truncated SHA-256 of user_id so
+    // the on-disk layout is the same 16-hex format as anonymous caches.
     std::unordered_map<uint64_t, std::unique_ptr<kv_ssd_cache>> user_caches_;
     std::unordered_map<uint64_t, std::unique_ptr<server_ssd_cache>> user_wrappers_;
 };
