@@ -301,6 +301,9 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 llama_build_and_test(test-kv-ssd-user-isolation.cpp)
+llama_build_and_test(test-ssd-cache-caps.cpp)
+llama_build_and_test(test-ssd-cache-continuation.cpp)
+llama_build_and_test(test-ssd-cache-prefix-match.cpp)
 # The residency tracker is intentionally an internal C++ component. Keep its
 # white-box unit test out of Windows shared-library builds, where the
 # implementation's internal llama symbols are not exported. Static builds

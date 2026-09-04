@@ -30,7 +30,7 @@ static void destroy_cache(kv_ssd_cache * cache, const std::filesystem::path & pa
     std::filesystem::remove_all(path, ec);
 }
 
-static bool test_partial_prefix_is_rejected() {
+static bool test_partial_prefix_is_bounded() {
     namespace fs = std::filesystem;
 
     const fs::path path = fs::temp_directory_path() / "test-ssd-cache-prefix-match-partial";
@@ -51,11 +51,16 @@ static bool test_partial_prefix_is_rejected() {
         stored_tokens.data(), stored_tokens.size());
     assert(checkpoint_id != 0);
 
+    int32_t lcp = 0;
+    bool partial = false;
     const uint64_t match = kv_ssd_find_match(
-        cache, query_tokens.data(), query_tokens.size(), 0, query_tokens.size());
+        cache, query_tokens.data(), query_tokens.size(), 0, query_tokens.size(),
+        -1, &lcp, &partial);
 
     destroy_cache(cache, path);
-    return match == 0;
+    // A checkpoint whose stored 4096-token prefix matches may be used, but
+    // callers must treat it as partial and restore no state after that prefix.
+    return match == checkpoint_id && partial && lcp == KV_SSD_TOKEN_PREFIX_MAX;
 }
 
 static bool test_exact_checkpoint_beats_partial_match() {
@@ -84,18 +89,21 @@ static bool test_exact_checkpoint_beats_partial_match() {
         partial_tokens.data(), partial_tokens.size());
     assert(partial_id != 0);
 
+    int32_t lcp = 0;
+    bool partial = true;
     const uint64_t match = kv_ssd_find_match(
-        cache, query_tokens.data(), query_tokens.size(), 0, query_tokens.size());
+        cache, query_tokens.data(), query_tokens.size(), 0, query_tokens.size(),
+        -1, &lcp, &partial);
 
     destroy_cache(cache, path);
-    return match == exact_id;
+    return match == exact_id && !partial && lcp == KV_SSD_TOKEN_PREFIX_MAX;
 }
 
 int main() {
     int failures = 0;
 
-    if (!test_partial_prefix_is_rejected()) {
-        fprintf(stderr, "partial prefix selected a checkpoint\n");
+    if (!test_partial_prefix_is_bounded()) {
+        fprintf(stderr, "partial prefix match was not bounded to the verified prefix\n");
         failures++;
     }
 
