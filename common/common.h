@@ -453,6 +453,7 @@ struct common_params {
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    int32_t max_concurrent_per_user = 0;    // 0 = unlimited. cap on in-flight slots per user_id (also applies to the anonymous bucket).
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
@@ -582,6 +583,22 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
+    // MoE expert SSD residency (Phase 1, madvise-based).
+    // When enabled, tracks which MoE experts fire per layer and uses madvise
+    // to keep hot experts paged in while cold ones are evicted from RAM.
+    // Reduces physical memory footprint of MoE models; relies on Linux mmap.
+    bool   moe_expert_residency    = false;  // master enable
+    int32_t moe_resident_per_layer = 32;     // experts kept hot per layer
+    bool   moe_residency_prewarm   = true;   // prewarm top-K experts at startup
+    int32_t moe_residency_top_k    = 16;     // prewarm K experts
+    bool   moe_residency_log       = true;   // log hit rate every 16 decodes
+    // When true, periodically sample each tracked expert's pages via
+    // mincore() and log the physical residency ratio alongside the
+    // software policy state. Off by default - this is for development
+    // and correctness verification, not production. Requires Linux.
+    bool   moe_residency_debug     = false;  // sample mincore() per decode
+    int32_t moe_residency_debug_interval = 64; // decodes between samples
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -628,10 +645,26 @@ struct common_params {
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
+    int32_t checkpoint_every_nt = -1;   // make a checkpoint every n tokens during prefill, -1 to disable
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    bool    checkpoint_near_end = false; // create a checkpoint near the end of every prompt (upstream default: false)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    std::string cache_ssd_path = "";       // path for SSD-backed KV cache (empty = disabled)
+    int32_t cache_ssd_max_checkpoints = 64;  // max checkpoints to store on SSD per slot
+    size_t cache_ssd_hot_window_tokens = 16384;  // always-keep window in tokens
+    size_t cache_ssd_warm_window_tokens = 32768;  // keep-in-RAM window in tokens
+    size_t cache_ssd_page_size_tokens = 1024;     // tokens per page (512/1024/2048)
+   int32_t cache_ssd_max_cold = 0;         // max cold tier checkpoints (0=unlimited)
+    int32_t cache_ssd_max_conversations = 16; // max conversation directories
+    int32_t cache_ssd_hot_ram_mib = 0;       // hot tier RAM budget in MiB (0=auto-size)
+    int32_t cache_ssd_warm_ram_mib = 0;      // warm tier RAM budget in MiB (0=auto-size)
+    int64_t cache_ssd_cold_max_size_mib = 0; // global cap on total cold tier bytes in MiB (0=unlimited)
+    int32_t prompt_cache_max = 8;           // max prompt buffer entries (deduplicated system prompts)
+    int32_t cache_ssd_system_prompts = 8;   // max global system prompts to cache (0=disabled)
+    int32_t cache_ssd_system_max_days = 30; // expire system prompts unused for N days (0=never)
+    bool cache_ssd_no_fsync = false;      // skip fsync on SSD checkpoint writes (trade durability for latency)
 
-    std::string hostname      = "127.0.0.1";
+   std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT

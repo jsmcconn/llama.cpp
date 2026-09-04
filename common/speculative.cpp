@@ -1043,8 +1043,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // turn on extraction of the target layers' input embeddings
+        const uint32_t n_layer_tgt = (uint32_t) llama_model_n_layer(model_tgt);
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            if (target_layer_ids[k] < n_layer_tgt) {
+                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            } else if (target_layer_ids[k] == n_layer_tgt) {
+                // Last target layer's input == post-final-layer hidden state, exposed
+                // as the "nextn" buffer (same convention EAGLE3 uses).
+                llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+            } else {
+                GGML_ABORT("DFlash: target layer id %d exceeds target n_layer %d",
+                        target_layer_ids[k], n_layer_tgt);
+            }
         }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
@@ -1137,8 +1147,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
                 batch_inject.n_tokens = n_chunk;
+                // target_layer_ids may include n_layer_tgt (the post-final-layer
+                // hidden state), which lives in the embeddings_nextn buffer rather
+                // than the per-layer embeddings_layer_inp buffers.
+                const uint32_t n_layer_tgt_l = (uint32_t) llama_model_n_layer(llama_get_model(ctx_tgt));
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    // target_layer_ids may include n_layer_tgt (the post-final-layer
+                    // hidden state), which lives in the embeddings_nextn buffer.
+                    const float * layer = target_layer_ids[k] < n_layer_tgt_l
+                        ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k])
+                        : llama_get_embeddings_nextn(ctx_tgt);
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
@@ -1435,6 +1453,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+    }
+
+    // Serialize pending_h so it survives SSD cold-start restore.
+    // Without this, the cross-token carry-over embedding is zeroed after
+    // restart, causing one wrong KV cell in ctx_dft for the entire session.
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (is_mem_shared) return false; // shared-memory MTP has no separate pending_h
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) return false;
+
+        const auto & h = pending_h[seq_id];
+        data.resize(h.size() * sizeof(float));
+        std::memcpy(data.data(), h.data(), data.size());
+        return !data.empty();
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (is_mem_shared) return;
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) return;
+        if (data.size() != (size_t) n_embd * sizeof(float)) return;
+
+        std::memcpy(pending_h[seq_id].data(), data.data(), data.size());
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -2541,6 +2580,8 @@ common_speculative_init_result::common_speculative_init_result(
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+
+        mparams.model_shared = model_tgt;
 
         llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
         if (model_dft == NULL) {

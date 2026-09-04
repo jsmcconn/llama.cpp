@@ -1190,6 +1190,8 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
+    // IMROPE/MROPE models (Qwen2.5-VL, Qwen3.5/3.6) store multi-dimensional
+    // positional data in kv_cell_ext; seq_add/seq_div cannot shift this.
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
@@ -1984,11 +1986,15 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
     if (k_shift) {
-        kv_self->set_input_k_shift(k_shift);
+        if (k_shift->buffer) {
+            kv_self->set_input_k_shift(k_shift);
+        }
     }
 
-    if (k_rot && k_rot->buffer) {
-        kv_self->set_input_k_rot(k_rot);
+    if (k_rot) {
+        if (k_rot->buffer) {
+            kv_self->set_input_k_rot(k_rot);
+        }
     }
 }
 
@@ -1998,6 +2004,24 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     auto * ctx = res->get_ctx();
     auto * gf  = res->get_gf();
+
+    // Skip K-shift if no layers have RoPE. Otherwise k_shift/k_rot are
+    // created and registered as graph inputs but never added to the graph
+    // (no ggml_build_forward_expand calls), so ggml_backend_sched_alloc_graph
+    // never allocates a buffer for them. The subsequent set_inputs(nullptr)
+    // would then crash on the NULL-buffer GGML_ASSERT in set_input_k_shift.
+    {
+        bool has_rope = false;
+        for (const auto & layer : layers) {
+            if (hparams.has_rope(layer.il)) {
+                has_rope = true;
+                break;
+            }
+        }
+        if (!has_rope) {
+            return gf;
+        }
+    }
 
     auto inp = std::make_unique<llm_graph_input_k_shift>(this);
 

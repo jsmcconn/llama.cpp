@@ -52,6 +52,10 @@ json format_error_response(const std::string & message, const enum error_type ty
             type_str = "exceed_context_size_error";
             code = 400;
             break;
+        case ERROR_TYPE_RATE_LIMIT:
+            type_str = "rate_limit_error";
+            code = 429;
+            break;
     }
     return json {
         {"code", code},
@@ -488,7 +492,13 @@ void server_tokens::push_back(llama_token tok) {
 void server_tokens::push_back(const mtmd_input_chunk * chunk) {
     auto type = mtmd_input_chunk_get_type(chunk);
     if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-        GGML_ASSERT(has_mtmd);
+        // Auto-mark the container as holding media when an IMAGE/AUDIO chunk is
+        // actually pushed. Previously this asserted has_mtmd was already set,
+        // which forced all slots on a multimodal model to be pre-flagged at
+        // initialization time (mctx != nullptr). That conflated model
+        // capability with slot content and caused get_tokens()/set_token()/
+        // context-shift/cache-reuse asserts to fire on text-only requests on
+        // multimodal models (issue #11).
         const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
         size_t start_idx = tokens.size();
         for (size_t i = 0; i < n_tokens; ++i) {
@@ -496,6 +506,7 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
         }
         mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
         map_idx_to_media[start_idx] = std::move(new_chunk);
+        has_mtmd = true;
     } else if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         size_t n_tokens;
         const auto * text_tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
@@ -948,7 +959,18 @@ server_tokens process_mtmd_prompt(
     if (tokenized != 0) {
         throw std::runtime_error("Failed to tokenize prompt");
     }
-    auto result = server_tokens(chunks, true);
+    // Only mark the container as having media when an IMAGE/AUDIO chunk is
+    // actually present. For OAI chat requests routed through this path on a
+    // multimodal model, chunks holds only TEXT chunks (no files attached),
+    // but the previous code unconditionally set has_mtmd=true. That caused
+    // get_tokens() and other text-only operations to assert in the slot/task
+    // processing path. See issue #11.
+    bool has_media = false;
+    for (size_t i = 0; i < chunks.size() && !has_media; ++i) {
+        const auto type = mtmd_input_chunk_get_type(chunks[i]);
+        has_media = (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) || (type == MTMD_INPUT_CHUNK_TYPE_AUDIO);
+    }
+    auto result = server_tokens(chunks, has_media);
     return result;
 }
 

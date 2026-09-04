@@ -64,6 +64,13 @@ struct task_params {
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 
+    // Per-request: number of leading prompt tokens that form a stable
+    // prefix (system prompt + thread_summary). When set, the LCP matcher
+    // rejects any slot whose stored prompt does not share this prefix,
+    // so a CLIO trim that keeps system+summary byte-identical still
+    // produces a high-similarity match. 0 = disabled (legacy behavior).
+    int32_t prompt_stable_prefix_tokens = 0;
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
@@ -139,6 +146,11 @@ struct server_task {
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
 
+    // explicit, operator-declared user identity. empty = anonymous bucket.
+    // validated against ^[a-zA-Z0-9\-_]+$ and <= 512 chars at request time.
+    // drives SSD cache routing (u/ namespace) and per-user concurrency cap.
+    std::string user_id;
+
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
     int id_slot   = -1;
@@ -212,6 +224,18 @@ struct server_task {
                 return false;
         }
     }
+
+    static task_params params_from_json_cmpl(
+        const llama_vocab * vocab,
+        const common_params & params_base,
+        const int n_ctx_slot,
+        const std::vector<llama_logit_bias> & logit_bias_eog,
+        const json & data);
+
+    // validate a user_id against the allowed character set and length.
+    // returns the input on success, throws std::invalid_argument on failure.
+    // empty string is valid (anonymous bucket).
+    static std::string validate_user_id(std::string user_id);
 
     // utility function
     static std::unordered_set<int> get_list_id(const std::vector<server_task> & tasks) {
@@ -598,6 +622,9 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // timestamp of last access (used for smarter cache eviction)
+    int64_t t_last_used = 0;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -631,7 +658,21 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
-    void update();
+    // update cache, evicting entries that exceed memory limits
+    // tokens_ref: the incoming task tokens, used to compute overlap for smarter eviction
+    void update(const server_tokens * tokens_ref = nullptr);
+
+    // Force eviction of the least valuable checkpoint to free up KV cache space.
+    // tokens_ref: if provided, overlap with this is used to avoid evicting useful entries
+    // Returns true if an entry was evicted, false if cache is empty.
+    bool evict(const server_tokens * tokens_ref = nullptr);
+
+private:
+    // Find the least valuable cache entry to evict.
+    // Scores entries by: recency (older = more evictable), size (larger = more evictable),
+    // and overlap with tokens_ref (less overlap = more evictable).
+    // Returns iterator to the worst entry.
+    std::list<server_prompt_cache_state>::iterator find_eviction_candidate(const server_tokens * tokens_ref = nullptr);
 };
 
 // used exclusively by router mode

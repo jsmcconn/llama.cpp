@@ -17,6 +17,10 @@ add_library(${TARGET} STATIC
     server-context.h
     server-stream.cpp
     server-stream.h
+    server-context-page-manager.cpp
+    server-context-page-manager.h
+    server-context-ssd-cache.cpp
+    server-context-ssd-cache.h
     server-tools.cpp
     server-tools.h
     server-mcp.cpp
@@ -48,7 +52,16 @@ set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(${TARGET} PRIVATE ../mtmd ${CMAKE_SOURCE_DIR})
-target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+if (LLAMA_BUILD_UI)
+    # LLAMA_BUILD_UI is a CMake option, not a preprocessor macro.
+    # Without this target_compile_definitions the #ifdef LLAMA_BUILD_UI
+    # guard in server-http.cpp is always false and the UI serving
+    # code is dead even when llama-ui is linked. See issue #13.
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_BUILD_UI)
+    target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+else()
+    target_link_libraries(${TARGET} PUBLIC server-context cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+endif()
 
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)

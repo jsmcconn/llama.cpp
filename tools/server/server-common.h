@@ -61,6 +61,7 @@ enum error_type {
     ERROR_TYPE_PERMISSION,
     ERROR_TYPE_UNAVAILABLE, // custom error
     ERROR_TYPE_NOT_SUPPORTED, // custom error
+    ERROR_TYPE_RATE_LIMIT, // custom error - per-user concurrency cap
     ERROR_TYPE_EXCEED_CONTEXT_SIZE, // custom error
 };
 
@@ -220,7 +221,18 @@ public:
 
     bool empty() const { return tokens.empty(); }
 
+    // True when the container actually holds image/audio chunks (i.e. has
+    // rendered slide content for a multimodal model). Distinct from has_mtmd,
+    // which is overloaded to also mean "model is multimodal" - this one
+    // strictly reflects slot content. See issue #11.
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     void clear() {
+        // also reset the has_mtmd flag so a cleared container is recognised as
+        // a plain text container. Without this, a slot whose prompt was reset
+        // after a previous media turn would still report has_mtmd=true and
+        // cause text-only operations to assert (issue #11).
+        has_mtmd = false;
         map_idx_to_media.clear();
         tokens.clear();
     }

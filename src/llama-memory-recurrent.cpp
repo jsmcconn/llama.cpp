@@ -194,13 +194,16 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
-                const bool pending = rs_idx[seq_id] != 0;
+                const bool pending = (size_t) seq_id < rs_idx.size() && rs_idx[seq_id] != 0;
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
                 }
-                return false;
+                // rollback failed - fall through to regular cell clearing instead of
+                // returning false, which would cause GGML_ABORT in the caller.
+                // The partial rollback is an optimization for recurrent models;
+                // the regular cell clearing loop below handles this case correctly.
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
@@ -241,6 +244,76 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != size && new_head < head) {
         head = new_head;
+    }
+
+    return true;
+}
+
+bool llama_memory_recurrent::seq_rm_positions_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (p0 < 0) {
+        p0 = 0;
+    }
+
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+
+    // remove seq_id from cells with positions in [p0, p1) WITHOUT
+    // touching cell.pos, tail, src, used, head, or rs_idx. this is
+    // strictly a position-tracking clear that bypasses the n_rs_seq
+    // rollback path in seq_rm() - which can fail (return false) when
+    // rollback would exceed n_rs_seq on mamba/GDN-style models.
+    //
+    // purpose: after a hybrid-model checkpoint restore loads full
+    // recurrent state with positions extending past the checkpoint's
+    // logical end (e.g., the previous turn's generated tokens), the
+    // seq_pos_min/max reporting still reflects those stale positions.
+    // llama_batch_init validation fails because Y (new batch start)
+    // is not >= X (memory seq_pos_max) + 1.
+    //
+    // the previous seq_rm_attn_only workaround tried to dodge this by
+    // only clearing mem_attn and leaving mem_recr untouched - but that
+    // kept the stale positions in mem_recr intact, so hybrid
+    // seq_pos_max (which returns min(attn, recr)) was still affected.
+    //
+    // this method lets hybrid memory clear mem_recr's stale positions
+    // safely: the underlying R/S tensor data is preserved (so no
+    // rollback crash), but seq_id is removed from cells past p0, so
+    // seq_pos_max correctly reports p0 - 1. on the next prefill of
+    // the divergent tokens starting at p0, the model recovers from
+    // any bounded drift in the small divergent region.
+    //
+    // returns true unconditionally - no rollback path to fail.
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].pos >= p0 && cells[i].pos < p1) {
+            if (seq_id < 0) {
+                cells[i].seq_id.clear();
+            } else if (cells[i].has_seq_id(seq_id)) {
+                cells[i].seq_id.erase(seq_id);
+            }
+        }
+    }
+
+    // Update the per-seq tail pointer to reflect any cleared cells past
+    // the new boundary. The tail points to the highest-position cell with
+    // seq_id - if we cleared the actual tail, find_slot will assert on
+    // cells[tail] not having seq_id during the next llama_decode.
+    if (seq_id >= 0 && (uint32_t) seq_id < size) {
+        int32_t & tail_id = cells[seq_id].tail;
+        if (tail_id >= 0 && !cells[tail_id].has_seq_id(seq_id)) {
+            // search backwards from tail for the new tail
+            int32_t new_tail = -1;
+            llama_pos new_tail_pos = -1;
+            for (uint32_t i = 0; i < size; ++i) {
+                if (cells[i].has_seq_id(seq_id)) {
+                    if (cells[i].pos > new_tail_pos) {
+                        new_tail_pos = cells[i].pos;
+                        new_tail = (int32_t) i;
+                    }
+                }
+            }
+            tail_id = new_tail;
+        }
     }
 
     return true;

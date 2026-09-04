@@ -157,6 +157,33 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_hybrid_idx::seq_rm_attn_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // Qwen4Exp (QSA) mirrors the indexer cache onto the attention cache, so
+    // they must always carry the same seq_id bookkeeping for the same cell
+    // indices. llama_memory_hybrid::seq_rm_attn_only strips the attention
+    // cells AND clears stale position tracking in mem_recr (without touching
+    // its R/S data, which avoids the n_rs_seq rollback failure on mamba/GDN),
+    // but it leaves the indexer untouched. On qwen4exp that desyncs the
+    // indexer from the attention cache: subsequent apply_ubatch calls see
+    // cells in the indexer that the attn no longer has, the indexer's
+    // invariant purging kicks in, and the next state_write produces a
+    // smaller indexer section than the attn's mirrored layout expects.
+    // Result on state_read: "mirrored slot layout holds N cells, this cache
+    // restores M", and the slot ends up with an empty seq while
+    // slot.prompt.tokens still has the old prefix -- the pos_min == -1
+    // assert in find_slot's pre_decode probe.
+    //
+    // The indexer is a llama_kv_cache, not a recurrent memory, so its
+    // seq_rm has no rollback path to fail. Calling it with the same range
+    // as the attn keeps the mirror in lockstep.
+
+    if (mem_idx) {
+        mem_idx->seq_rm(seq_id, p0, p1);
+    }
+
+    return llama_memory_hybrid::seq_rm_attn_only(seq_id, p0, p1);
+}
+
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
 
