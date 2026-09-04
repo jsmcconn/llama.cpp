@@ -521,7 +521,10 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
 void server_tokens::push_back_placeholder(const mtmd_input_chunk * chunk) {
     auto type = mtmd_input_chunk_get_type(chunk);
     if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-        GGML_ASSERT(has_mtmd);
+        // The placeholder is inserted into a slot-owned container that may
+        // start as a text-only container even when the model supports media.
+        // Mark it here, just as push_back() does for a full media chunk.
+        has_mtmd = true;
         mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_get_placeholder(chunk));
         GGML_ASSERT(new_chunk != nullptr && "failed to create placeholder chunk");
         const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
