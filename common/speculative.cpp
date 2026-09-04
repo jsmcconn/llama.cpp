@@ -1043,7 +1043,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // turn on extraction of the target layers' input embeddings
-        const uint32_t n_layer_tgt = (uint32_t) llama_model_n_layer(model_tgt);
+        const int32_t n_layer_tgt = llama_model_n_layer(model_tgt);
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             if (target_layer_ids[k] < n_layer_tgt) {
                 llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
@@ -1150,7 +1150,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // target_layer_ids may include n_layer_tgt (the post-final-layer
                 // hidden state), which lives in the embeddings_nextn buffer rather
                 // than the per-layer embeddings_layer_inp buffers.
-                const uint32_t n_layer_tgt_l = (uint32_t) llama_model_n_layer(llama_get_model(ctx_tgt));
+                const int32_t n_layer_tgt_l = llama_model_n_layer(llama_get_model(ctx_tgt));
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     // target_layer_ids may include n_layer_tgt (the post-final-layer
                     // hidden state), which lives in the embeddings_nextn buffer.
