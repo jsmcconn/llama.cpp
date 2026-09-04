@@ -1559,8 +1559,18 @@ private:
                     params_base.cache_ssd_warm_ram_mib);
         }
 
-        // Initialize global system prompt cache (cross-conversation reuse)
-        if (params_base.cache_ssd_system_prompts > 0 && !params_base.cache_ssd_path.empty()) {
+        // A system-cache snapshot stores target state only and is captured at
+        // the end of the full prompt, after the detected system boundary. It
+        // cannot be rewound to that boundary for recurrent target/draft state,
+        // and it cannot restore the separate MTP draft state. Keep it disabled
+        // for hybrid models; per-conversation checkpoints persist both states
+        // at exact boundaries and are the safe cache for Qwen Flash Next.
+        const bool system_cache_has_recurrent_state =
+            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+            (ctx_dft && ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS);
+        if (params_base.cache_ssd_system_prompts > 0 &&
+            !params_base.cache_ssd_path.empty() &&
+            !system_cache_has_recurrent_state) {
             // Compute model compat_hash (same FNV-1a as set_model_info)
             char desc_buf[2048];
             int desc_len = llama_model_desc(model_tgt, desc_buf, sizeof(desc_buf));
@@ -1604,6 +1614,10 @@ private:
                 SRV_WRN("%s\n", "system prompt cache init failed, disabling");
                 sys_cache.reset();
             }
+        } else if (params_base.cache_ssd_system_prompts > 0 &&
+                   !params_base.cache_ssd_path.empty() &&
+                   system_cache_has_recurrent_state) {
+            SRV_INF("%s\n", "system prompt cache disabled for recurrent target/draft state");
         }
 
         if (!params_base.model_alias.empty()) {
@@ -4146,6 +4160,16 @@ private:
                             !slot.task->tokens.has_media()) {
                             const auto & task_tokens = slot.task->tokens.get_tokens();
                             if (!task_tokens.empty()) {
+                                const bool ssd_has_recurrent_state =
+                                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                                    (ctx_dft && ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS);
+                                // A recurrent checkpoint at the exact task extent has
+                                // already consumed the final prompt token. The server must
+                                // evaluate one token to produce logits, but recurrent state
+                                // cannot be rewound before re-evaluating that token. Only
+                                // restore boundaries with at least one real suffix token.
+                                const uint64_t ssd_max_n_tokens = task_tokens.size() -
+                                    (ssd_has_recurrent_state ? 1 : 0);
                                 int32_t ssd_pos_min = 0, ssd_pos_max = 0;
                                 uint64_t ssd_n_tokens = 0;
                                 int32_t ssd_lcp = 0;
@@ -4153,13 +4177,14 @@ private:
                                 bool ssd_is_continuation = false;
                                 bool ssd_partial = false;
                                 std::vector<uint8_t> ssd_spec_data;
-                                if (ssd_page_manager->find_and_load_checkpoint(
+                                if (ssd_max_n_tokens > 0 &&
+                                    ssd_page_manager->find_and_load_checkpoint(
                                         task_tokens.data(), task_tokens.size(),
                                         ssd_turn_counter, ctx_tgt, ctx_dft.get(),
                                         (uint32_t)slot.id,
                                         ssd_pos_min, ssd_pos_max, ssd_n_tokens,
                                         &ssd_spec_data,
-                                        slot.conv_hash, 0, (uint64_t)task_tokens.size(),
+                                        slot.conv_hash, 0, ssd_max_n_tokens,
                                         &ssd_lcp, &ssd_overlap, &ssd_is_continuation,
                                         &ssd_partial,
                                         slot.task->user_id,

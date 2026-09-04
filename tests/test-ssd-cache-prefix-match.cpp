@@ -148,11 +148,41 @@ static bool test_full_append_match_survives_partial_disable() {
     int32_t lcp = 0;
     bool partial = true;
     const uint64_t match = kv_ssd_find_match(
-        cache, query_tokens.data(), query_tokens.size(), 0, query_tokens.size(),
+        cache, query_tokens.data(), query_tokens.size(), 0, query_tokens.size() - 1,
         -1, &lcp, &partial, /* allow_partial = */ false);
 
     destroy_cache(cache, path);
     return match == checkpoint_id && !partial && lcp == KV_SSD_TOKEN_PREFIX_MAX;
+}
+
+static bool test_exact_extent_can_be_excluded_for_recurrent_state() {
+    namespace fs = std::filesystem;
+
+    const fs::path path = fs::temp_directory_path() / "test-ssd-cache-prefix-match-exact-extent";
+    kv_ssd_cache * cache = create_cache(path);
+
+    constexpr size_t checkpoint_tokens = 8192;
+    std::vector<uint32_t> query_tokens(checkpoint_tokens);
+    for (uint32_t i = 0; i < query_tokens.size(); ++i) {
+        query_tokens[i] = i;
+    }
+    const std::array<uint8_t, 1> state = { 0 };
+    const uint64_t checkpoint_id = kv_ssd_store(
+        cache, 0, state.data(), state.size(), 0, checkpoint_tokens - 1,
+        checkpoint_tokens, 1, query_tokens.data(), query_tokens.size());
+    assert(checkpoint_id != 0);
+
+    int32_t lcp = 0;
+    bool partial = false;
+    const uint64_t excluded = kv_ssd_find_match(
+        cache, query_tokens.data(), query_tokens.size(), 0, checkpoint_tokens - 1,
+        -1, &lcp, &partial, /* allow_partial = */ false);
+    const uint64_t allowed = kv_ssd_find_match(
+        cache, query_tokens.data(), query_tokens.size(), 0, checkpoint_tokens,
+        -1, &lcp, &partial, /* allow_partial = */ false);
+
+    destroy_cache(cache, path);
+    return excluded == 0 && allowed == checkpoint_id && !partial;
 }
 
 int main() {
@@ -175,6 +205,11 @@ int main() {
 
     if (!test_full_append_match_survives_partial_disable()) {
         fprintf(stderr, "full append checkpoint was hidden when partial matching was disabled\n");
+        failures++;
+    }
+
+    if (!test_exact_extent_can_be_excluded_for_recurrent_state()) {
+        fprintf(stderr, "exact-extent checkpoint ignored the recurrent max-token cap\n");
         failures++;
     }
 
