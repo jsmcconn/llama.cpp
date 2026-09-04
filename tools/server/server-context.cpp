@@ -42,9 +42,10 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-static bool server_tokens_is_strong_continuation(
+static bool server_tokens_is_usable_continuation(
         const server_tokens & cached,
-        const server_tokens & incoming) {
+        const server_tokens & incoming,
+        float min_similarity) {
     if (cached.empty() || incoming.empty()) {
         return false;
     }
@@ -54,9 +55,8 @@ static bool server_tokens_is_strong_continuation(
     }
 
     const size_t common_prefix = cached.get_common_prefix(incoming);
-    const size_t shorter = std::min(cached.size(), incoming.size());
 
-    return shorter > 0 && common_prefix * 10 >= shorter * 9;
+    return common_prefix > 0 && float(common_prefix) / incoming.size() > min_similarity;
 }
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -1856,20 +1856,20 @@ private:
                     continue;
                 }
 
-                // A continuation can append tokens to the cached prompt,
-                // changing the first-1024-token hash without crossing a real
-                // conversation boundary. Preserve the hash guard for unrelated
-                // prompts, but allow a strong LCP continuation through it.
-                const bool strong_continuation = server_tokens_is_strong_continuation(tokens, task.tokens);
-                if (slot.conv_hash != 0 && slot.conv_hash != task_conv_hash && !strong_continuation) {
+                // A continuation can append or edit tokens in the cached
+                // prompt, changing the first-1024-token hash without crossing
+                // a real conversation boundary. Preserve the hash guard for
+                // prompts that would not pass the normal LCP similarity gate.
+                const int common_prefix = tokens.get_common_prefix(task.tokens);
+                const bool usable_continuation = server_tokens_is_usable_continuation(
+                    tokens, task.tokens, slot_prompt_similarity);
+                if (slot.conv_hash != 0 && slot.conv_hash != task_conv_hash && !usable_continuation) {
                     SLT_DBG(slot, "LCP match rejected: conv_hash mismatch (slot=0x%016lx task=0x%016lx) - different conversation\n",
                             (unsigned long)slot.conv_hash, (unsigned long)task_conv_hash);
                     continue;
                 }
 
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
-                const int common_prefix = tokens.get_common_prefix(task.tokens);
-
                 // Stable-prefix gate: if the caller told us how many leading
                 // tokens form a stable prefix (system prompt + thread_summary),
                 // reject any slot whose stored prompt does not share that
@@ -2046,7 +2046,7 @@ private:
                 // a match from the NEW session instead of restoring stale
                 // context from the previous conversation.
                 if (!session_reset && ret->conv_hash != 0 && ret->conv_hash != task_conv_hash &&
-                    !server_tokens_is_strong_continuation(ret->prompt.tokens, task.tokens)) {
+                    !server_tokens_is_usable_continuation(ret->prompt.tokens, task.tokens, slot_prompt_similarity)) {
                     session_reset = true;
                 }
 
@@ -2298,7 +2298,7 @@ private:
         const bool stateless = (slot.task->type == SERVER_TASK_TYPE_EMBEDDING);
         const bool conv_boundary = !stateless && !slot.task->tokens.has_media() &&
             slot.conv_hash != 0 && slot.conv_hash != task_conv_hash &&
-            !server_tokens_is_strong_continuation(slot.prompt.tokens, slot.task->tokens);
+            !server_tokens_is_usable_continuation(slot.prompt.tokens, slot.task->tokens, slot_prompt_similarity);
         if (slot.needs_session_reset || conv_boundary) {
             if (!slot.needs_session_reset) {
                 SLT_INF(slot, "conversation boundary detected (conv_hash: slot=0x%016lx task=0x%016lx) - purging KV cache and prompt for new session\n",
