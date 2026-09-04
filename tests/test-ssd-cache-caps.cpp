@@ -194,10 +194,15 @@ static void test_durable_plan_and_duplicate_suppression() {
                                     branch_tokens.data(), branch_tokens.size(), 0, false, false);
     assert(branch.action == KV_SSD_STORE_WRITE);
 
-    // Context position and state-shape mismatches are never cadence-skipped.
-    auto different_pos = kv_ssd_plan_store(c, 0, 1, 4196, 4196, 4,
+    // Exact prompts with different context positions are not duplicate state.
+    auto different_pos = kv_ssd_plan_store(c, 0, 1, 4096, 4096, 4,
                                            tokens.data(), tokens.size(), 0, false, false);
     assert(different_pos.action == KV_SSD_STORE_WRITE);
+    // Recurrent checkpoints naturally advance pos_min/pos_max with an append;
+    // token-prefix compatibility, rather than equal positions, drives cadence.
+    auto advanced_pos = kv_ssd_plan_store(c, 0, 17, 4212, 4196, 4,
+                                          tokens.data(), tokens.size(), 0, false, false);
+    assert(advanced_pos.action == KV_SSD_STORE_SKIP_CADENCE);
     auto different_draft = kv_ssd_plan_store(c, 0, 0, 4195, 4196, 4,
                                              tokens.data(), tokens.size(), 0, true, false);
     assert(different_draft.action == KV_SSD_STORE_WRITE);
