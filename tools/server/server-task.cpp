@@ -996,6 +996,7 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     thinking_block_started = state.thinking_block_started;
     text_block_started     = state.text_block_started;
 
+    oai_resp_created       = state.oai_resp_created;
     oai_resp_id            = state.oai_resp_id;
     oai_resp_reasoning_id  = state.oai_resp_reasoning_id;
     oai_resp_message_id    = state.oai_resp_message_id;
@@ -1003,6 +1004,10 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
 
     // track if the accumulated message has any reasoning content
     anthropic_has_reasoning = !state.chat_msg.reasoning_content.empty();
+
+    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && !state.oai_resp_created && (is_progress || n_decoded == 1)) {
+        state.oai_resp_created = true;
+    }
 
     // Pre-compute state updates based on diffs (for next chunk)
     for (const common_chat_msg_diff & diff : oaicompat_msg_diffs) {
@@ -1161,7 +1166,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
 json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
     std::vector<json> events;
 
-    if (n_decoded == 1) {
+    if (!oai_resp_created) {
         events.push_back(json {
             {"event", "response.created"},
             {"data", json {
@@ -1173,6 +1178,18 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                 }},
             }},
         });
+        events.push_back(json {
+            {"event", "response.in_progress"},
+            {"data", json {
+                {"type", "response.in_progress"},
+                {"response", json {
+                    {"id",     oai_resp_id},
+                    {"object", "response"},
+                    {"status", "in_progress"},
+                }},
+            }},
+        });
+    } else if (is_progress) {
         events.push_back(json {
             {"event", "response.in_progress"},
             {"data", json {

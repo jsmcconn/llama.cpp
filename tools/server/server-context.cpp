@@ -1934,7 +1934,13 @@ private:
                          ret->user_id_ == task.user_id &&
                          ret->conv_hash != 0 &&
                          ret->conv_hash == task_conv_hash);
-                    if (!same_session) {
+                    // An explicit slot request is an operator-level choice:
+                    // preserve the upstream LCP behavior for that slot even
+                    // when the prompt changes enough that f_keep is low.
+                    // The heuristic remains for automatic slot selection,
+                    // where a low-quality match can otherwise reuse a stale
+                    // conversation.
+                    if (!same_session && task.id_slot == -1) {
                         session_reset = session_reset || (f_keep < 0.5f && sim_best < 0.95f);
                     } else {
                         SLT_DBG(*ret, "session continuity preserved (user_id match + conv_hash=0x%016lx match), "
