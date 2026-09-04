@@ -1130,7 +1130,6 @@ kv_ssd_store_plan kv_ssd_plan_store(
         if (cache->model_identity != 0 && checkpoint.model_identity != 0 &&
             checkpoint.model_identity != cache->model_identity) continue;
         if ((checkpoint.dft_data_size > 0) != has_dft_state) continue;
-        if ((checkpoint.spec_data_size > 0) != has_spec_state) continue;
         if (checkpoint.n_tokens > n_tokens) continue;
         const size_t compare_count = std::min(prefix_count, (size_t)checkpoint.n_tokens);
         if (checkpoint.token_prefix.size() < compare_count) continue;
@@ -1139,7 +1138,8 @@ kv_ssd_store_plan kv_ssd_plan_store(
         if (checkpoint.token_hash != incoming_hash((size_t)checkpoint.n_tokens)) continue;
 
         if (checkpoint.n_tokens == n_tokens && checkpoint.token_hash == token_hash &&
-            checkpoint.pos_min == pos_min && checkpoint.pos_max == pos_max) {
+            checkpoint.pos_min == pos_min && checkpoint.pos_max == pos_max &&
+            ((checkpoint.spec_data_size > 0) == has_spec_state)) {
             if (duplicate_id == 0 || checkpoint.turn_created > cache->index[duplicate_id].turn_created ||
                 (checkpoint.turn_created == cache->index[duplicate_id].turn_created && id > duplicate_id)) {
                 duplicate_id = id;

@@ -201,8 +201,14 @@ static void test_durable_plan_and_duplicate_suppression() {
     // Recurrent checkpoints naturally advance pos_min/pos_max with an append;
     // token-prefix compatibility, rather than equal positions, drives cadence.
     auto advanced_pos = kv_ssd_plan_store(c, 0, 17, 4212, 4196, 4,
-                                          tokens.data(), tokens.size(), 0, false, false);
+                                          tokens.data(), tokens.size(), 0, false, true);
     assert(advanced_pos.action == KV_SSD_STORE_SKIP_CADENCE);
+    // Speculative implementation state is optional at append boundaries. A
+    // mismatched exact state is not reused, while the self-consistent older
+    // target+draft checkpoint remains a valid durable prefix for an append.
+    auto different_spec = kv_ssd_plan_store(c, 0, 0, 4095, 4096, 4,
+                                            tokens.data(), tokens.size(), 0, false, true);
+    assert(different_spec.action == KV_SSD_STORE_WRITE);
     auto different_draft = kv_ssd_plan_store(c, 0, 0, 4195, 4196, 4,
                                              tokens.data(), tokens.size(), 0, true, false);
     assert(different_draft.action == KV_SSD_STORE_WRITE);
@@ -219,6 +225,28 @@ static void test_durable_plan_and_duplicate_suppression() {
     assert(age_due.action == KV_SSD_STORE_WRITE);
 
     kv_ssd_free(c);
+
+    // Exercise the inverse transition as well: a checkpoint containing the
+    // optional speculative blob can still govern append cadence when the new
+    // boundary has no blob, while an exact state with the blob is reusable.
+    kv_ssd_cache * c_spec = kv_ssd_init(scratch.string().c_str(), &cfg, 0xD00EULL);
+    assert(c_spec != nullptr);
+    const std::vector<uint8_t> spec_state(32, 0x3c);
+    const uint64_t spec_id = kv_ssd_store(c_spec, 0, state.data(), state.size(), 0, 4095,
+                                          4096, 1, tokens.data(), tokens.size(), 0,
+                                          nullptr, 0, spec_state.data(), spec_state.size());
+    assert(spec_id != 0);
+
+    auto exact_with_spec = kv_ssd_plan_store(c_spec, 0, 0, 4095, 4096, 2,
+                                             tokens.data(), tokens.size(), 0, false, true);
+    assert(exact_with_spec.action == KV_SSD_STORE_REUSE);
+    assert(exact_with_spec.checkpoint_id == spec_id);
+
+    auto append_without_spec = kv_ssd_plan_store(c_spec, 0, 17, 4212, 4196, 3,
+                                                  tokens.data(), tokens.size(), 0, false, false);
+    assert(append_without_spec.action == KV_SSD_STORE_SKIP_CADENCE);
+
+    kv_ssd_free(c_spec);
     fs::remove_all(scratch);
 }
 
