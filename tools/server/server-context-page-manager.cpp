@@ -34,7 +34,7 @@ static uint64_t sha256_namespace_key(const std::string & s) {
 
 server_context_page_manager::server_context_page_manager(
     const char* ssd_path,
-    const kv_eviction_config* cfg,
+    const ::kv_ssd_config* cfg,
     size_t /* n_tokens_total */,
     size_t max_cross_slot_checkpoints
 ) : max_cross_slot_checkpoints_(max_cross_slot_checkpoints)
@@ -43,17 +43,8 @@ server_context_page_manager::server_context_page_manager(
     std::error_code ec_fs;
     fs::create_directories(ssd_path, ec_fs);
 
-    kv_ssd_config ssd_cfg;
-    if (cfg) {
-        ssd_cfg.hot_ram_bytes = cfg->max_hot_bytes > 0 ? cfg->max_hot_bytes : 2ULL * 1024 * 1024 * 1024;
-        ssd_cfg.warm_ram_bytes = cfg->max_warm_bytes > 0 ? cfg->max_warm_bytes : 1ULL * 1024 * 1024 * 1024;
-        ssd_cfg.hot_window_tokens = cfg->hot_window_tokens;
-        ssd_cfg.hot_turns = cfg->turn_inactivity_threshold > 0 ? cfg->turn_inactivity_threshold : 2;
-        ssd_cfg.warm_turns = cfg->turn_inactivity_threshold > 0 ? cfg->turn_inactivity_threshold * 2 : 4;
-        ssd_cfg.auto_size = cfg->auto_size;
-        ssd_cfg.max_cold_checkpoints = cfg->max_cold_checkpoints;
-        ssd_cfg.memory_reserve = cfg->memory_reserve;
-    }
+    ::kv_ssd_config ssd_cfg;
+    if (cfg) ssd_cfg = *cfg;
     if (ssd_cfg.hot_ram_bytes == 0) ssd_cfg.hot_ram_bytes = 2ULL * 1024 * 1024 * 1024;
     if (ssd_cfg.warm_ram_bytes == 0) ssd_cfg.warm_ram_bytes = 1ULL * 1024 * 1024 * 1024;
     if (ssd_cfg.hot_turns == 0) ssd_cfg.hot_turns = 2;

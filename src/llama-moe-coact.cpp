@@ -11,9 +11,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <map>
 #include <sstream>
-#include <sys/stat.h>
+#include <system_error>
 
 namespace llama_moe_coact {
 
@@ -177,7 +178,8 @@ std::string persistence_path(const std::string & model_path) {
     if (!home || !*home) home = "/tmp";
 
     std::string dir = std::string(home) + "/.cachylla/coactivation";
-    mkdir(dir.c_str(), 0755);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
     return dir + "/" + base + ".json";
 }
 

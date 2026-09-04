@@ -16,20 +16,24 @@
 #include <cmath>
 #include <cstring>
 #include <cerrno>
+#if defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-static inline size_t page_align_down(size_t x) {
-    return x & ~(size_t(getpagesize()) - 1);
-}
-
-static inline size_t page_align_up(size_t x) {
-    return (x + size_t(getpagesize()) - 1) & ~(size_t(getpagesize()) - 1);
-}
+#if defined(__linux__)
+static constexpr int MOE_MADV_COLD = MADV_COLD;
+static constexpr int MOE_MADV_WILLNEED = MADV_WILLNEED;
+static constexpr int MOE_MADV_DONTNEED = MADV_DONTNEED;
+#else
+static constexpr int MOE_MADV_COLD = 0;
+static constexpr int MOE_MADV_WILLNEED = 0;
+static constexpr int MOE_MADV_DONTNEED = 0;
+#endif
 
 // Cache scoring helpers
 
@@ -82,6 +86,7 @@ static void safe_madvise(void * base, size_t len, int advice,
                          uint64_t & c_einval,
                          uint64_t & c_invalid_map,
                          bool log_failures) {
+#if defined(__linux__)
     if (!base || len == 0) {
         c_invalid_map++;
         return;
@@ -110,6 +115,17 @@ static void safe_madvise(void * base, size_t len, int advice,
             reinterpret_cast<void *>(page_start),
             aligned_len, e, strerror(e));
     }
+#else
+    (void) base;
+    (void) len;
+    (void) advice;
+    (void) advice_name;
+    (void) c_success;
+    (void) c_failure;
+    (void) c_einval;
+    (void) c_invalid_map;
+    (void) log_failures;
+#endif
 }
 
 template <typename Fn>
@@ -255,7 +271,7 @@ void llama_moe_residency_touch(
             // valid for this mapping type.
             for_each_tensor(lr, [&](void * base, size_t stride) {
                 safe_madvise(reinterpret_cast<uint8_t *>(base) + eoff * stride,
-                             stride, MADV_COLD, "MADV_COLD",
+                             stride, MOE_MADV_COLD, "MADV_COLD",
                              st->advice_success, st->advice_failure,
                              st->advice_einval, st->invalid_mapping,
                              st->cfg.log_advice_failures);
@@ -280,7 +296,7 @@ void llama_moe_residency_touch(
     const size_t off = (size_t) expert_id;
     for_each_tensor(lr, [&](void * base, size_t stride) {
         safe_madvise(reinterpret_cast<uint8_t *>(base) + off * stride,
-                     stride, MADV_WILLNEED, "MADV_WILLNEED",
+                     stride, MOE_MADV_WILLNEED, "MADV_WILLNEED",
                      st->advice_success, st->advice_failure,
                      st->advice_einval, st->invalid_mapping,
                      st->cfg.log_advice_failures);
@@ -352,7 +368,7 @@ void llama_moe_residency_prewarm(
             const size_t off = (size_t) expert_id;
             for_each_tensor(lr, [&](void * base, size_t stride) {
                 safe_madvise(reinterpret_cast<uint8_t *>(base) + off * stride,
-                             stride, MADV_WILLNEED, "MADV_WILLNEED",
+                             stride, MOE_MADV_WILLNEED, "MADV_WILLNEED",
                              st->advice_success, st->advice_failure,
                              st->advice_einval, st->invalid_mapping,
                              st->cfg.log_advice_failures);
@@ -374,7 +390,7 @@ void llama_moe_residency_release(
             const size_t off = (size_t) e.expert_id;
             for_each_tensor(lr, [&](void * base, size_t stride) {
                 safe_madvise(reinterpret_cast<uint8_t *>(base) + off * stride,
-                             stride, MADV_DONTNEED, "MADV_DONTNEED",
+                             stride, MOE_MADV_DONTNEED, "MADV_DONTNEED",
                              st->advice_success, st->advice_failure,
                              st->advice_einval, st->invalid_mapping,
                              st->cfg.log_advice_failures);

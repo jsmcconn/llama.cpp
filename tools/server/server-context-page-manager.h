@@ -6,7 +6,6 @@
 #define SERVER_CONTEXT_PAGE_MANAGER_H
 
 #include "common/kv-ssd-cache.h"
-#include "common/kv_page_manager.h"
 #include "llama.h"
 #include "server-task.h"
 #include "server-common.h"
@@ -44,7 +43,7 @@ public:
 
     server_context_page_manager(
         const char* ssd_path,
-        const kv_eviction_config* cfg,
+        const ::kv_ssd_config* cfg,
         size_t n_tokens_total,
         size_t max_cross_slot_checkpoints
     );
@@ -221,7 +220,7 @@ private:
 
     // Per-conversation caches (conv_hash -> cache instance)
     std::string ssd_base_path_;
-    kv_ssd_config config_;
+    ::kv_ssd_config config_;
     uint64_t model_compat_hash_ = 0;
     std::unordered_map<uint64_t, std::unique_ptr<kv_ssd_cache>> conv_caches_;
     std::unordered_map<uint64_t, std::unique_ptr<server_ssd_cache>> conv_wrappers_;
