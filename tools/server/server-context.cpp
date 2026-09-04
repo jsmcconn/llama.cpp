@@ -3528,10 +3528,14 @@ private:
                     try {
                         size_t n_packed = 0;
                         llama_tokens packed;
+                        SRV_DBG("slot restore begin: slot=%d file=%s\n", slot->id, filepath.c_str());
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
+                        SRV_DBG("slot restore header: nread=%zu n_packed=%zu\n", nread, n_packed);
                         if (nread != 0) {
                             packed.resize(std::max<size_t>(1, n_packed));
+                            SRV_DBG("slot restore state load begin: capacity=%zu\n", packed.size());
                             nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                            SRV_DBG("slot restore state load done: nread=%zu n_packed=%zu\n", nread, n_packed);
                         }
                         if (nread == 0) {
                             throw std::runtime_error("No available space in KV cache or invalid slot save file");
@@ -3539,6 +3543,7 @@ private:
                         packed.resize(n_packed);
 
                         server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+                        SRV_DBG("slot restore tokens decoded: size=%zu has_media=%d\n", restored.size(), (int) restored.has_media());
 
                         if (restored.size() > (size_t) slot->n_ctx) {
                             throw std::runtime_error("Restored prompt does not fit in the slot context");
@@ -3550,6 +3555,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        SRV_DBG("slot restore prompt installed: size=%zu\n", slot->prompt.tokens.size());
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
