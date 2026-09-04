@@ -1218,6 +1218,9 @@ private:
             // progress callback
             mparams_dft.progress_callback           = load_progress_callback;
             mparams_dft.progress_callback_user_data = &load_progress_spec;
+            // Shared Qwen4Exp MTP exports omit target-owned embeddings and the
+            // output head. Make them available while the draft model is loaded.
+            mparams_dft.model_shared = model_tgt;
 
             model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
             if (model_dft == nullptr) {
@@ -2034,6 +2037,16 @@ private:
         }
 
         if (ret) {
+            // A media prompt contains placeholder positions backed by encoded
+            // embeddings. It cannot seed the text-only prompt cache, and a
+            // text prompt cannot seed a later media request.
+            if (ret->prompt.tokens.has_media() != task.tokens.has_media()) {
+                SLT_INF(*ret, "%s", "media boundary: clearing incompatible slot state\n");
+                ret->prompt_clear();
+                ret->needs_session_reset = true;
+                update_cache = false;
+            }
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks
@@ -2302,9 +2315,12 @@ private:
         // slot on small embedding models). needs_session_reset still fires
         // so error/recovery paths are unaffected.
         const bool stateless = (slot.task->type == SERVER_TASK_TYPE_EMBEDDING);
-        const bool conv_boundary = !stateless && !slot.task->tokens.has_media() &&
-            slot.conv_hash != 0 && slot.conv_hash != task_conv_hash &&
-            !server_tokens_is_usable_continuation(slot.prompt.tokens, slot.task->tokens, slot_prompt_similarity);
+        const bool media_boundary =
+            slot.prompt.tokens.has_media() != slot.task->tokens.has_media();
+        const bool conv_boundary = !stateless && (media_boundary ||
+            (!slot.task->tokens.has_media() &&
+             slot.conv_hash != 0 && slot.conv_hash != task_conv_hash &&
+             !server_tokens_is_usable_continuation(slot.prompt.tokens, slot.task->tokens, slot_prompt_similarity)));
         if (slot.needs_session_reset || conv_boundary) {
             if (!slot.needs_session_reset) {
                 SLT_INF(slot, "conversation boundary detected (conv_hash: slot=0x%016lx task=0x%016lx) - purging KV cache and prompt for new session\n",
@@ -2987,7 +3003,9 @@ private:
                 cur.pos_min, (float) cur.size() / 1024 / 1024);
 
         // SSD-backed KV cache: store checkpoint on disk
-        if (ssd_page_manager) {
+        // Serialized SSD checkpoints contain text token IDs; media embeddings
+        // and placeholders must be re-encoded by the multimodal path.
+        if (ssd_page_manager && !slot.prompt.tokens.has_media()) {
             const auto & prefix_tokens = slot.prompt.tokens;
             ssd_page_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur,
@@ -3177,7 +3195,9 @@ private:
                 slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
                 cur.pos_min, (float)cur.size() / 1024 / 1024);
 
-        if (ssd_page_manager) {
+        // Do not persist media turns as text-only SSD checkpoints.
+        if (ssd_page_manager &&
+            !(slot.task ? slot.task->tokens.has_media() : slot.prompt.tokens.has_media())) {
             const auto & prefix_tokens = slot.task
                 ? slot.task->tokens.get_tokens()
                 : slot.prompt.tokens.get_tokens();
@@ -3193,7 +3213,7 @@ private:
     // Check if this slot's current prompt represents a system prompt
     // that should be stored in the global cache.
     void maybe_extract_system_prompt(server_slot & slot) {
-        if (!sys_cache || !ssd_page_manager) {
+        if (!sys_cache || !ssd_page_manager || !slot.task || slot.task->tokens.has_media()) {
             return;
         }
 
@@ -4100,7 +4120,8 @@ private:
 
                         // cold start: try per-conversation SSD checkpoint restore
                         // Must populate slot.prompt.tokens so get_common_prefix() finds the match
-                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_page_manager) {
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_page_manager &&
+                            !slot.task->tokens.has_media()) {
                             const auto & task_tokens = slot.task->tokens.get_tokens();
                             if (!task_tokens.empty()) {
                                 int32_t ssd_pos_min = 0, ssd_pos_max = 0;
@@ -4262,7 +4283,8 @@ private:
                         // Only cold starts (empty slot) need system prompt cache.
                         // Warm slots (n_tokens > 0) already have full context from
                         // the in-memory prompt cache LCP restore or previous turn.
-                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && sys_cache && ssd_page_manager) {
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && sys_cache && ssd_page_manager &&
+                            !slot.task->tokens.has_media()) {
                             const auto & task_tokens = slot.task->tokens.get_tokens();
                             int n_sys = kv_detect_system_prompt_boundary(
                                 llama_model_get_vocab(llama_get_model(ctx_tgt)),
@@ -4574,7 +4596,8 @@ private:
                             // inserts a few dynamic tokens between the system section and
                             // the first user message, shifting the boundary by tens of
                             // tokens between turns.
-                            if (n_past == 0 && slot.prompt.n_tokens() > 0 && sys_cache && ssd_page_manager) {
+                            if (n_past == 0 && slot.prompt.n_tokens() > 0 && sys_cache && ssd_page_manager &&
+                                !slot.task->tokens.has_media()) {
                                 const auto & task_tokens = slot.task->tokens.get_tokens();
                                 int n_sys = kv_detect_system_prompt_boundary(
                                     llama_model_get_vocab(llama_get_model(ctx_tgt)),
