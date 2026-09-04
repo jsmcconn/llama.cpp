@@ -23,7 +23,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
-#include <unistd.h>
 #include <filesystem>
 #include <random>
 #include <string>
@@ -32,12 +31,12 @@
 namespace fs = std::filesystem;
 
 static std::string make_temp_dir(const std::string & tag) {
-    char buf[256];
-    std::snprintf(buf, sizeof(buf), "/tmp/cachyllama-ssd-test-%s-%d",
-                  tag.c_str(), (int) getpid());
-    fs::remove_all(buf);
-    fs::create_directories(buf);
-    return std::string(buf);
+    static uint64_t serial = 0;
+    const fs::path path = fs::temp_directory_path() /
+        ("cachyllama-ssd-test-" + tag + "-" + std::to_string(++serial));
+    fs::remove_all(path);
+    fs::create_directories(path);
+    return path.string();
 }
 
 static uint64_t random_conv_hash() {
