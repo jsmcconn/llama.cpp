@@ -95,8 +95,8 @@ static void test_rf_scoring() {
     // All 4 slots are now occupied. The next touch should evict one.
     // Since expert 3 was most recently touched, expert 5 (touched once
     // earlier) should be the eviction target.
-    const int pre_total_misses = st.total_misses;
-    const int pre_total_evicted = st.total_evicted;
+    const uint64_t pre_total_misses = st.total_misses;
+    const uint64_t pre_total_evicted = st.total_evicted;
 
     llama_moe_residency_touch(&st, 0, 11, nullptr);
 
