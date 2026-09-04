@@ -1796,7 +1796,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_SSD_MAX_CONVERSATIONS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-ssd-cold-maxsize"}, "N",
-        string_format("global cap on total cold tier size across all conversations in MiB (default: %lld, 0=unlimited)",
+        string_format("global cap on all SSD checkpoint files across all conversations in MiB (default: %lld, 0=unlimited)",
             (long long)params.cache_ssd_cold_max_size_mib),
         [](common_params & params, int value) {
             if (value < 0) {
@@ -1805,6 +1805,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ssd_cold_max_size_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_SSD_COLD_MAXSIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-durable-min-growth"}, "N",
+        string_format("minimum compatible-prefix token growth between durable SSD checkpoints (default: %d, 0=disabled)",
+            params.cache_ssd_durable_min_growth),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value for --cache-ssd-durable-min-growth: must be >= 0");
+            }
+            params.cache_ssd_durable_min_growth = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_DURABLE_MIN_GROWTH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-durable-max-age"}, "N",
+        string_format("maximum seconds between durable SSD checkpoints for a compatible prompt (default: %d, 0=disabled)",
+            params.cache_ssd_durable_max_age),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value for --cache-ssd-durable-max-age: must be >= 0");
+            }
+            params.cache_ssd_durable_max_age = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_DURABLE_MAX_AGE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-auto-user"},
+        {"--no-cache-ssd-auto-user"},
+        string_format("derive stable content-based cache IDs through the first user message when llama_user_id is absent; intended for single-tenant servers because identical first turns share a namespace (default: %s)",
+            params.cache_ssd_auto_user ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.cache_ssd_auto_user = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_AUTO_USER").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--prompt-max"}, "N",
         string_format("max system prompt cache entries (default: %d, 0=disabled)", params.prompt_cache_max),

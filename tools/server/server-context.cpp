@@ -59,6 +59,28 @@ static bool server_tokens_is_usable_continuation(
     return common_prefix > 0 && float(common_prefix) / incoming.size() > min_similarity;
 }
 
+static uint64_t server_task_conversation_hash(const server_task & task) {
+    if (task.tokens.has_media()) return 0;
+    const auto & tokens = task.tokens.get_tokens();
+    if (tokens.empty()) return 0;
+    return kv_ssd_hash_conversation(
+        (const uint32_t *)tokens.data(), tokens.size(),
+        task.params.message_spans.first_user_message_end());
+}
+
+static std::string server_task_automatic_user_id(const server_task & task) {
+    // Only synthesize an identity when chat parsing found a first user span.
+    // Raw completions retain the anonymous continuation path.
+    if (task.tokens.has_media() || task.params.message_spans.first_user_message_end() == 0) {
+        return {};
+    }
+    const uint64_t hash = server_task_conversation_hash(task);
+    if (hash == 0) return {};
+    char id[32];
+    snprintf(id, sizeof(id), "auto-%016" PRIx64, hash);
+    return id;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -1532,6 +1554,8 @@ private:
             cfg.max_cold_checkpoints = params_base.cache_ssd_max_cold;
             cfg.hot_turns = 2;
             cfg.warm_turns = 4;
+            cfg.durable_min_growth_tokens = (size_t)params_base.cache_ssd_durable_min_growth;
+            cfg.durable_max_age_ms = (uint64_t)params_base.cache_ssd_durable_max_age * 1000ULL;
 
             ssd_page_manager = std::make_unique<llama::server_context_page_manager>(
                 params_base.cache_ssd_path.c_str(), &cfg,
@@ -1540,10 +1564,10 @@ private:
             // Global cap on cold tier bytes across all conversation directories.
             // 0 = unlimited (legacy default). Specified in MiB for parity with
             // --cache-ssd-hot-ram / --cache-ssd-warm-ram.
-            ssd_page_manager->cold_max_size_bytes =
+            ssd_page_manager->set_cold_max_size_bytes(
                 params_base.cache_ssd_cold_max_size_mib > 0
-                    ? (size_t)params_base.cache_ssd_cold_max_size_mib * 1024 * 1024
-                    : 0;
+                    ? (size_t) params_base.cache_ssd_cold_max_size_mib * 1024 * 1024
+                    : 0);
             ssd_page_manager->set_no_fsync(params_base.cache_ssd_no_fsync);
 
             // Set model info after page manager exists
@@ -1553,10 +1577,12 @@ private:
             // Seed turn counter from max on disk (persistent across restarts)
             ssd_turn_counter = ssd_page_manager->get_max_turn_id() + 1;
 
-            SRV_INF("SSD cache enabled: path=%s, hot=%d MiB, warm=%d MiB\n",
+            SRV_INF("SSD cache enabled: path=%s, hot=%d MiB, warm=%d MiB, durable growth=%d tokens, max age=%d s\n",
                     params_base.cache_ssd_path.c_str(),
                     params_base.cache_ssd_hot_ram_mib,
-                    params_base.cache_ssd_warm_ram_mib);
+                    params_base.cache_ssd_warm_ram_mib,
+                    params_base.cache_ssd_durable_min_growth,
+                    params_base.cache_ssd_durable_max_age);
         }
 
         // A system-cache snapshot stores target state only and is captured at
@@ -1801,22 +1827,10 @@ private:
         bool update_cache = false;
         bool session_reset = false;  // set when slot belongs to a different conversation
 
-        // Compute the incoming task's conversation hash from the first 1024
-        // tokens. This is compared against each slot's stored conv_hash to
-        // detect conversation boundaries (new agent sessions). When a mismatch
-        // is detected, the slot's KV cache + prompt are purged so the new
-        // session starts fresh instead of being corrupted by stale context.
-        uint64_t task_conv_hash = 0;
-        {
-            if (!task.tokens.has_media()) {
-                const auto & task_tokens = task.tokens.get_tokens();
-                if (!task_tokens.empty()) {
-                    size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
-                    task_conv_hash = kv_ssd_hash_tokens(
-                        (const uint32_t *)task_tokens.data(), hash_len);
-                }
-            }
-        }
+        // Include the first user message in the stable conversation key. Agent
+        // harnesses commonly share system prompts longer than 1024 tokens, so
+        // hashing only that prefix merged unrelated sessions into one cache.
+        const uint64_t task_conv_hash = server_task_conversation_hash(task);
 
         // Per-user concurrency cap. If the requesting user_id (or the
         // _anonymous bucket for empty user_id) is already at the cap,
@@ -1874,7 +1888,7 @@ private:
                 }
 
                 // A continuation can append or edit tokens in the cached
-                // prompt, changing the first-1024-token hash without crossing
+                // prompt, changing the stable conversation hash without crossing
                 // a real conversation boundary. Preserve the hash guard for
                 // prompts that would not pass the normal LCP similarity gate.
                 const int common_prefix = tokens.get_common_prefix(task.tokens);
@@ -1916,14 +1930,14 @@ private:
                 // Detect conversation boundary via LCP quality: when the
                 // stored prompt is NOT a prefix of the incoming task (f_keep < 0.5)
                 // AND the match is poor (sim_best < 0.95), the slot belongs
-                // to a different conversation even if the first 1024 tokens
-                // (conv_hash) happen to match. This catches new sessions with
+                // to a different conversation even if the stable conversation
+                // key happens to match. This catches new sessions with
                 // the same system prompt but different conversation bodies.
                 // The sim_best < 0.95 guard avoids false positives on
                 // legitimate trims where the task IS a prefix of the stored
                 // prompt (sim = 1.0) — only the length differs.
                 // When llama_user_id is present and matches the slot owner,
-                // and conv_hash matches (same first 1024 tokens), session
+                // and conv_hash matches (same system/first-user prefix), session
                 // continuity is already established via user_id + conv_hash.
                 // CLIO's prompt architecture has a large stable prefix
                 // (prompt_stable_prefix_tokens, ~29K tokens: system prompt +
@@ -2304,17 +2318,7 @@ private:
         // agent session ended (or a new one started), and the slot's KV cache
         // + prompt must be purged to avoid corrupting the new conversation with
         // stale context from the previous one.
-        uint64_t task_conv_hash = 0;
-        {
-            if (!slot.task->tokens.has_media()) {
-                const auto & task_tokens = slot.task->tokens.get_tokens();
-                if (!task_tokens.empty()) {
-                    size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
-                    task_conv_hash = kv_ssd_hash_tokens(
-                        (const uint32_t *)task_tokens.data(), hash_len);
-                }
-            }
-        }
+        const uint64_t task_conv_hash = server_task_conversation_hash(*slot.task);
 
         // Detect conversation boundary: if the slot already has a conv_hash
         // (from a previous task) and it differs from the incoming task's hash,
@@ -5720,6 +5724,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             } catch (const std::invalid_argument & e) {
                 throw std::invalid_argument(
                     std::string("invalid llama_user_id: ") + e.what());
+            }
+            if (params.cache_ssd_auto_user && task.user_id.rfind("auto-", 0) == 0) {
+                throw std::invalid_argument(
+                    "invalid llama_user_id: the auto- prefix is reserved when --cache-ssd-auto-user is enabled");
+            }
+            if (task.user_id.empty() && params.cache_ssd_auto_user) {
+                task.user_id = server_task_automatic_user_id(task);
+                if (!task.user_id.empty()) {
+                    SRV_DBG("SSD cache: synthesized stable session identity %s\n",
+                            task.user_id.c_str());
+                }
             }
 
             // OAI-compat

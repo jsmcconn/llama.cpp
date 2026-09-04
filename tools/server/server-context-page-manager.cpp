@@ -68,6 +68,12 @@ void server_context_page_manager::set_no_fsync(bool no_fsync) {
     }
 }
 
+void server_context_page_manager::set_cold_max_size_bytes(size_t max_bytes) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    cold_max_size_bytes_ = max_bytes;
+    enforce_disk_size_cap_locked();
+}
+
 server_context_page_manager::~server_context_page_manager() {
     // Each unique_ptr in conv_caches_ handles its own kv_ssd_free
 }
@@ -270,6 +276,29 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
         : get_or_create_user_cache(user_id);
     if (!sc) return false;
 
+    // Apply durable cadence before serializing target and draft state. This
+    // is the critical placement for long contexts: a skipped 262K checkpoint
+    // avoids both a ~10 GiB host allocation/copy and the SSD write.
+    const kv_ssd_store_plan plan = sc->plan_store(
+        slot_id, ctx_dft, ckpt, tokens, tokens_size, turn_id);
+    if (plan.action == KV_SSD_STORE_SKIP_CADENCE) {
+        LOG_INF("SSD cache: durable write deferred slot=%u tokens=%lu base=%lu growth=%lu age=%lu ms\n",
+                slot_id, (unsigned long)ckpt.n_tokens,
+                (unsigned long)plan.base_n_tokens,
+                (unsigned long)plan.growth_tokens,
+                (unsigned long)plan.age_ms);
+        stored_checkpoint retained;
+        retained.checkpoint_id = plan.checkpoint_id;
+        retained.slot_id = slot_id;
+        retained.turn_id = turn_id;
+        retained.n_tokens = plan.base_n_tokens;
+        retained.last_access = get_timestamp_ms();
+        retained.user_scoped = !user_id.empty();
+        retained.cache_key = retained.user_scoped ? sha256_namespace_key(user_id) : conv_hash;
+        checkpoints_.insert_or_assign(slot_id, std::move(retained));
+        return true;
+    }
+
     // Evict if needed
     if (checkpoints_.find(slot_id) == checkpoints_.end() &&
         max_cross_slot_checkpoints_ > 0 &&
@@ -279,8 +308,14 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
         if (it != checkpoints_.end()) evict_slot_internal(it->first);
     }
 
-    uint64_t ckpt_id = sc->store(slot_id, ctx, ctx_dft, ckpt, tokens, tokens_size, turn_id);
+    uint64_t ckpt_id = plan.action == KV_SSD_STORE_REUSE
+        ? plan.checkpoint_id
+        : sc->store(slot_id, ctx, ctx_dft, ckpt, tokens, tokens_size, turn_id);
     if (ckpt_id == 0) return false;
+    if (plan.action == KV_SSD_STORE_REUSE) {
+        LOG_INF("SSD cache: reused exact durable checkpoint %lu slot=%u tokens=%lu\n",
+                (unsigned long)ckpt_id, slot_id, (unsigned long)ckpt.n_tokens);
+    }
 
     stored_checkpoint sc2;
     sc2.checkpoint_id = ckpt_id;
@@ -300,10 +335,12 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
 
     checkpoints_.insert_or_assign(slot_id, std::move(sc2));
 
-    // Enforce global cold tier byte cap (--cache-ssd-cold-maxsize). Eviction
-    // happens after the store so writes never fail due to the cap; the cost
-    // is a brief overshoot of the cap until the next store triggers eviction.
-    evict_conversations_for_size_locked();
+    // Enforce the global on-disk byte cap after a real write. Exact reuse does
+    // not change disk occupancy. The cap counts all tiers and unloaded cache
+    // directories and evicts individual old checkpoints.
+    if (plan.action == KV_SSD_STORE_WRITE) {
+        enforce_disk_size_cap_locked();
+    }
 
     return true;
 }
@@ -448,12 +485,12 @@ bool server_context_page_manager::find_matching_checkpoint(
         if (ckpt_id == 0) { cache_misses_++; return false; }
 
         kv_ssd_cache* raw = user_caches_[key].get();
-        const kv_ssd_checkpoint* meta = kv_ssd_get_meta(raw, ckpt_id);
-        if (meta) {
-            out_slot_id = meta->slot_id;
-            out_pos_min = meta->pos_min;
-            out_pos_max = meta->pos_max;
-            out_n_tokens = meta->n_tokens;
+        kv_ssd_checkpoint meta;
+        if (kv_ssd_get_meta(raw, ckpt_id, meta)) {
+            out_slot_id = meta.slot_id;
+            out_pos_min = meta.pos_min;
+            out_pos_max = meta.pos_max;
+            out_n_tokens = meta.n_tokens;
             cache_hits_++;
             return true;
         }
@@ -490,12 +527,12 @@ bool server_context_page_manager::find_matching_checkpoint(
     // IDs are local to each conversation cache, so use the selected cache's
     // own metadata instead of comparing bare IDs in the cross-cache slot map.
     kv_ssd_cache* raw = conv_caches_[effective_conv].get();
-    const kv_ssd_checkpoint* meta = kv_ssd_get_meta(raw, ckpt_id);
-    if (meta) {
-        out_slot_id = meta->slot_id;
-        out_pos_min = meta->pos_min;
-        out_pos_max = meta->pos_max;
-        out_n_tokens = meta->n_tokens;
+    kv_ssd_checkpoint meta;
+    if (kv_ssd_get_meta(raw, ckpt_id, meta)) {
+        out_slot_id = meta.slot_id;
+        out_pos_min = meta.pos_min;
+        out_pos_max = meta.pos_max;
+        out_n_tokens = meta.n_tokens;
         cache_hits_++;
         return true;
     }
@@ -767,146 +804,40 @@ server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const st
 } // namespace llama
 
 // =============================================================================
-// Cold tier global byte cap
+// Filesystem-backed global byte cap
 // =============================================================================
 
 namespace llama {
 
-size_t server_context_page_manager::compute_cold_total_bytes_locked() const {
-    auto sum_cache_bytes = [](const kv_ssd_cache* cache) -> size_t {
-        if (!cache) return 0;
-        size_t total = 0;
-        // Index holds cold entries until they're ring-buffer-evicted or
-        // explicitly deleted. Hot/warm entries also stay in the index,
-        // so filter by tier to avoid double-counting RAM blobs as SSD usage.
-        for (const auto& [id, ckpt] : cache->index) {
-            if (ckpt.tier == KV_TIER_COLD) {
-                total += ckpt.data_size + ckpt.dft_data_size + ckpt.spec_data_size;
+void server_context_page_manager::enforce_disk_size_cap_locked() {
+    if (cold_max_size_bytes_ == 0) return;
+
+    std::vector<kv_ssd_evicted_checkpoint> evicted;
+    const size_t total = kv_ssd_enforce_size_cap(
+        ssd_base_path_.c_str(), cold_max_size_bytes_, &evicted);
+
+    for (const auto& item : evicted) {
+        auto& caches = item.user_scoped ? user_caches_ : conv_caches_;
+        auto cache_it = caches.find(item.cache_key);
+        if (cache_it != caches.end()) {
+            kv_ssd_forget_checkpoint(cache_it->second.get(), item.checkpoint_id);
+        }
+        for (auto it = checkpoints_.begin(); it != checkpoints_.end();) {
+            if (it->second.user_scoped == item.user_scoped &&
+                it->second.cache_key == item.cache_key &&
+                it->second.checkpoint_id == item.checkpoint_id) {
+                it = checkpoints_.erase(it);
+            } else {
+                ++it;
             }
         }
-        return total;
-    };
-
-    size_t total = 0;
-    for (const auto& [conv, cache] : conv_caches_) {
-        total += sum_cache_bytes(cache.get());
-    }
-    for (const auto& [key, cache] : user_caches_) {
-        total += sum_cache_bytes(cache.get());
-    }
-    return total;
-}
-
-void server_context_page_manager::evict_conversations_for_size_locked() {
-    if (cold_max_size_bytes == 0) return;
-
-    size_t total = compute_cold_total_bytes_locked();
-    if (total <= cold_max_size_bytes) return;
-
-    // Build the eviction candidate list: (mtime, namespace, key).
-    // Anonymous caches live directly under ssd_base_path_; user caches live
-    // under ssd_base_path_/u/. We scan both namespaces together so a single
-    // conversation is one candidate regardless of where it lives on disk.
-    struct candidate {
-        time_t mtime;
-        bool is_user;
-        uint64_t key;
-    };
-    std::vector<candidate> candidates;
-
-    auto mtime_for = [](const fs::path& dir) -> time_t {
-        std::error_code ec;
-        auto ftime = fs::last_write_time(dir, ec);
-        if (ec) return 0;
-        return std::chrono::system_clock::to_time_t(
-            std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()));
-    };
-
-    candidates.reserve(conv_caches_.size() + user_caches_.size());
-    for (const auto& conv_pair : conv_caches_) {
-        char hex[17];
-        snprintf(hex, sizeof(hex), "%016lx", (unsigned long)conv_pair.first);
-        candidates.push_back({ mtime_for(fs::path(ssd_base_path_) / hex), false, conv_pair.first });
-    }
-    for (const auto& user_pair : user_caches_) {
-        char hex[17];
-        snprintf(hex, sizeof(hex), "%016lx", (unsigned long)user_pair.first);
-        candidates.push_back({ mtime_for(fs::path(ssd_base_path_) / "u" / hex), true, user_pair.first });
     }
 
-    // Oldest first - matches the existing --cache-ssd-max-conversations
-    // behavior so the two caps evict consistently.
-    std::sort(candidates.begin(), candidates.end(),
-        [](const candidate& a, const candidate& b) { return a.mtime < b.mtime; });
-
-    size_t evicted = 0;
-    for (const auto& c : candidates) {
-        if (total <= cold_max_size_bytes) break;
-
-        char hex[17];
-        snprintf(hex, sizeof(hex), "%016lx", (unsigned long)c.key);
-        fs::path dir = c.is_user
-            ? fs::path(ssd_base_path_) / "u" / hex
-            : fs::path(ssd_base_path_) / hex;
-
-        // Measure this conversation's contribution before deleting so the log
-        // line tells the user how much disk was actually reclaimed.
-        size_t freed = 0;
-        if (c.is_user) {
-            auto it = user_caches_.find(c.key);
-            if (it != user_caches_.end()) {
-                for (const auto& [id, ckpt] : it->second->index) {
-                    if (ckpt.tier == KV_TIER_COLD) {
-                        freed += ckpt.data_size + ckpt.dft_data_size + ckpt.spec_data_size;
-                    }
-                }
-            }
-        } else {
-            auto it = conv_caches_.find(c.key);
-            if (it != conv_caches_.end()) {
-                for (const auto& [id, ckpt] : it->second->index) {
-                    if (ckpt.tier == KV_TIER_COLD) {
-                        freed += ckpt.data_size + ckpt.dft_data_size + ckpt.spec_data_size;
-                    }
-                }
-            }
-        }
-
-        std::error_code ec;
-        for (const auto& entry : fs::directory_iterator(dir, ec)) {
-            std::error_code ec2;
-            fs::remove(entry.path(), ec2);
-        }
-        fs::remove(dir, ec);
-
-        if (c.is_user) {
-            user_wrappers_.erase(c.key);
-            user_caches_.erase(c.key);
-        } else {
-            conv_wrappers_.erase(c.key);
-            conv_caches_.erase(c.key);
-        }
-
-        // Checkpoint IDs are only unique inside one cache. Purge by the
-        // recorded namespace owner so an equal ID in another conversation
-        // cannot keep a stale slot entry alive.
-        purge_cache_checkpoints(c.is_user, c.key);
-
-        total = (freed > total) ? 0 : total - freed;
-        evicted++;
-
-        LOG_WRN("SSD cache: evicted conversation %skey=%016lx (%zu MiB freed, total=%zu MiB, cap=%zu MiB)\n",
-                c.is_user ? "user " : "",
-                (unsigned long)c.key,
-                freed / (1024 * 1024),
-                total / (1024 * 1024),
-                cold_max_size_bytes / (1024 * 1024));
-    }
-
-    if (evicted > 0) {
-        LOG_INF("SSD cache: --cache-ssd-cold-maxsize enforced (evicted=%zu, total=%zu MiB, cap=%zu MiB)\n",
-                evicted, total / (1024 * 1024), cold_max_size_bytes / (1024 * 1024));
+    if (!evicted.empty()) {
+        LOG_INF("SSD cache: --cache-ssd-cold-maxsize enforced at checkpoint granularity "
+                "(evicted=%zu total=%zu MiB cap=%zu MiB)\n",
+                evicted.size(), total / 1024 / 1024,
+                cold_max_size_bytes_ / 1024 / 1024);
     }
 }
 

@@ -25,11 +25,13 @@
 
 #include "kv-ssd-cache.h"
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -146,6 +148,156 @@ static void test_server_guard_logic() {
     assert(compute(-1, 0) == false);
 }
 
+static void test_durable_plan_and_duplicate_suppression() {
+    kv_ssd_config cfg;
+    cfg.auto_size = false;
+    cfg.hot_ram_bytes = 1024;
+    cfg.warm_ram_bytes = 512;
+    cfg.durable_min_growth_tokens = 4096;
+    cfg.durable_max_age_ms = 600000;
+
+    fs::path scratch = make_scratch("durable-plan");
+    kv_ssd_cache * c = kv_ssd_init(scratch.string().c_str(), &cfg, 0xD00DULL);
+    assert(c != nullptr);
+
+    std::vector<uint32_t> tokens(8192);
+    for (uint32_t i = 0; i < tokens.size(); ++i) tokens[i] = i + 1;
+    const std::vector<uint8_t> state(64, 0x5a);
+
+    auto first = kv_ssd_plan_store(c, 0, 0, 4095, 4096, 1,
+                                   tokens.data(), tokens.size(), 0, false, false);
+    assert(first.action == KV_SSD_STORE_WRITE);
+    const uint64_t id = kv_ssd_store(c, 0, state.data(), state.size(), 0, 4095,
+                                     4096, 1, tokens.data(), tokens.size());
+    assert(id != 0);
+
+    const fs::path checkpoint_path = fs::path(c->model_dir) / ("ckpt-" + std::to_string(id) + ".bin");
+    const auto written_at = fs::last_write_time(checkpoint_path);
+
+    auto duplicate = kv_ssd_plan_store(c, 0, 0, 4095, 4096, 2,
+                                       tokens.data(), tokens.size(), 0, false, false);
+    assert(duplicate.action == KV_SSD_STORE_REUSE);
+    assert(duplicate.checkpoint_id == id);
+    assert(c->next_id == id + 1);
+    assert(fs::last_write_time(checkpoint_path) == written_at);
+
+    auto deferred = kv_ssd_plan_store(c, 7, 0, 4195, 4196, 3,
+                                      tokens.data(), tokens.size(), 0, false, false);
+    assert(deferred.action == KV_SSD_STORE_SKIP_CADENCE);
+    assert(deferred.growth_tokens == 100);
+    assert(c->slot_latest.at(7) == id);
+
+    // A same-length branch must be written even when its stored prefix agrees.
+    auto branch_tokens = tokens;
+    branch_tokens[4095] ^= 0x55;
+    auto branch = kv_ssd_plan_store(c, 0, 0, 4095, 4096, 4,
+                                    branch_tokens.data(), branch_tokens.size(), 0, false, false);
+    assert(branch.action == KV_SSD_STORE_WRITE);
+
+    // Context position and state-shape mismatches are never cadence-skipped.
+    auto different_pos = kv_ssd_plan_store(c, 0, 1, 4196, 4196, 4,
+                                           tokens.data(), tokens.size(), 0, false, false);
+    assert(different_pos.action == KV_SSD_STORE_WRITE);
+    auto different_draft = kv_ssd_plan_store(c, 0, 0, 4195, 4196, 4,
+                                             tokens.data(), tokens.size(), 0, true, false);
+    assert(different_draft.action == KV_SSD_STORE_WRITE);
+
+    auto growth_due = kv_ssd_plan_store(c, 0, 0, 8191, 8192, 5,
+                                        tokens.data(), tokens.size(), 0, false, false);
+    assert(growth_due.action == KV_SSD_STORE_WRITE);
+
+    // A small append becomes due when the durable file reaches max age.
+    fs::last_write_time(checkpoint_path,
+                        fs::file_time_type::clock::now() - std::chrono::seconds(700));
+    auto age_due = kv_ssd_plan_store(c, 0, 0, 4195, 4196, 6,
+                                     tokens.data(), tokens.size(), 0, false, false);
+    assert(age_due.action == KV_SSD_STORE_WRITE);
+
+    kv_ssd_free(c);
+    fs::remove_all(scratch);
+}
+
+static void test_oversized_checkpoint_stays_cold() {
+    kv_ssd_config cfg;
+    cfg.auto_size = false;
+    cfg.hot_ram_bytes = 8;
+    cfg.warm_ram_bytes = 4;
+
+    fs::path scratch = make_scratch("oversized");
+    kv_ssd_cache * c = kv_ssd_init(scratch.string().c_str(), &cfg, 0xB16B00B5ULL);
+    const std::vector<uint8_t> state(64, 0x6b);
+    const uint32_t tokens[] = { 1, 2, 3, 4 };
+    const uint64_t id = kv_ssd_store(c, 0, state.data(), state.size(), 0, 3,
+                                     4, 1, tokens, 4);
+    assert(id != 0);
+    assert(c->hot_bytes == 0);
+    assert(c->index.at(id).tier == KV_TIER_COLD);
+
+    std::vector<uint8_t> loaded;
+    assert(kv_ssd_load(c, id, loaded));
+    assert(loaded == state);
+    assert(c->hot_bytes == 0);
+    assert(c->index.at(id).tier == KV_TIER_COLD);
+
+    // Reject a truncated payload before allocating restore vectors from its
+    // header sizes.
+    const fs::path checkpoint_path = fs::path(c->model_dir) / ("ckpt-" + std::to_string(id) + ".bin");
+    fs::resize_file(checkpoint_path, fs::file_size(checkpoint_path) - 1);
+    loaded.clear();
+    assert(!kv_ssd_load(c, id, loaded));
+
+    kv_ssd_free(c);
+    fs::remove_all(scratch);
+}
+
+static void test_global_cap_counts_disk_and_preserves_newest() {
+    kv_ssd_config cfg;
+    cfg.auto_size = false;
+    cfg.hot_ram_bytes = 1;
+    cfg.warm_ram_bytes = 1;
+    cfg.max_cold_checkpoints = 0;
+    fs::path scratch = make_scratch("global-cap");
+    const std::vector<uint8_t> state(128, 0x33);
+    const uint32_t tokens[] = { 10, 11, 12, 13 };
+
+    auto populate = [&](uint64_t key, const char * prefix) {
+        kv_ssd_cache * c = kv_ssd_init(scratch.string().c_str(), &cfg, key, prefix);
+        assert(kv_ssd_store(c, 0, state.data(), state.size(), 0, 3, 4, 1,
+                            tokens, 4) == 1);
+        assert(kv_ssd_store(c, 0, state.data(), state.size(), 0, 3, 4, 2,
+                            tokens, 4) == 2);
+        kv_ssd_free(c);
+    };
+    populate(0x11, "");
+    populate(0x22, "");
+    populate(0x33, "u/");
+
+    const fs::path sample = scratch / "0000000000000011" / "ckpt-1.bin";
+    const size_t file_size = (size_t)fs::file_size(sample);
+    std::vector<kv_ssd_evicted_checkpoint> evicted;
+    const size_t remaining = kv_ssd_enforce_size_cap(
+        scratch.string().c_str(), file_size * 4, &evicted);
+    assert(remaining <= file_size * 4);
+    assert(evicted.size() == 2);
+    assert(fs::exists(scratch / "0000000000000011" / "ckpt-2.bin"));
+    assert(fs::exists(scratch / "0000000000000022" / "ckpt-2.bin"));
+    assert(fs::exists(scratch / "u" / "0000000000000033" / "ckpt-2.bin"));
+
+    evicted.clear();
+    const size_t tighter = kv_ssd_enforce_size_cap(
+        scratch.string().c_str(), file_size * 2, &evicted);
+    assert(tighter <= file_size * 2);
+    size_t files_left = 0;
+    for (const auto & entry : fs::recursive_directory_iterator(scratch)) {
+        const std::string name = entry.path().filename().string();
+        if (entry.is_regular_file() && name.rfind("ckpt-", 0) == 0 &&
+            name.size() >= 4 && name.compare(name.size() - 4, 4, ".bin") == 0) files_left++;
+    }
+    assert(files_left == 2);
+
+    fs::remove_all(scratch);
+}
+
 int main(void) {
     printf("test-ssd-cache-caps: regression suite for issue #6\n");
     printf("====================================================\n\n");
@@ -153,6 +305,9 @@ int main(void) {
     RUN(explicit_caps_preserved);
     RUN(auto_size_still_runs);
     RUN(server_guard_logic);
+    RUN(durable_plan_and_duplicate_suppression);
+    RUN(oversized_checkpoint_stays_cold);
+    RUN(global_cap_counts_disk_and_preserves_newest);
 
     printf("\n====================================================\n");
     printf("Ran %d tests, %d failed\n", tests_run, tests_failed);

@@ -659,6 +659,9 @@ struct common_params {
     int32_t cache_ssd_hot_ram_mib = 0;       // hot tier RAM budget in MiB (0=auto-size)
     int32_t cache_ssd_warm_ram_mib = 0;      // warm tier RAM budget in MiB (0=auto-size)
     int64_t cache_ssd_cold_max_size_mib = 0; // global cap on total cold tier bytes in MiB (0=unlimited)
+    int32_t cache_ssd_durable_min_growth = 0; // min token growth between durable writes (0=disabled)
+    int32_t cache_ssd_durable_max_age = 0;    // max seconds between durable writes (0=disabled)
+    bool cache_ssd_auto_user = false;         // derive single-tenant, content-based IDs through the first user message
     int32_t prompt_cache_max = 8;           // max prompt buffer entries (deduplicated system prompts)
     int32_t cache_ssd_system_prompts = 8;   // max global system prompts to cache (0=disabled)
     int32_t cache_ssd_system_max_days = 30; // expire system prompts unused for N days (0=never)

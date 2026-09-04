@@ -179,17 +179,17 @@ public:
                         int cache_type_k, int cache_type_v);
     // Configure SSD checkpoint writes: when true, skip fsync for lower write latency.
     void set_no_fsync(bool no_fsync);
+    // Set and immediately enforce the global checkpoint byte cap.
+    void set_cold_max_size_bytes(size_t max_bytes);
 
 
     // Max conversations: LRU eviction of entire conversation directories when exceeded.
     // Set before any store/find calls. Default: 16.
     int max_conversations = 16;
 
-    // Global cap on total cold tier bytes across all conversation directories.
-    // When exceeded, oldest conversations (by mtime) are evicted as whole directories.
+    // Global cap on every ckpt-*.bin file across all conversation directories.
+    // When exceeded, oldest individual checkpoints are removed first.
     // 0 = unlimited. Default: 0.
-    size_t cold_max_size_bytes = 0;
-
     std::unordered_map<uint32_t, stored_checkpoint> checkpoints_; // slot_id -> checkpoint
     size_t max_cross_slot_checkpoints_;
     mutable std::shared_mutex mutex_;
@@ -214,21 +214,15 @@ private:
     // caches is disabled (privacy).
     server_ssd_cache* get_or_create_user_cache(const std::string& user_id);
 
-    // Compute the total bytes of cold tier checkpoints across all
-    // conversation directories (anonymous + user-scoped). Scans indexes;
-    // O(total_checkpoints). Caller must hold mutex_.
-    size_t compute_cold_total_bytes_locked() const;
-
-    // Evict whole conversation directories (oldest by mtime first) until
-    // total cold bytes <= cold_max_size_bytes, or no more conversations
-    // can be evicted. Logs each evicted directory. No-op when cap is 0.
-    // Caller must hold mutex_.
-    void evict_conversations_for_size_locked();
+    // Enforce the filesystem-backed global cap and synchronize any removed
+    // checkpoint with loaded cache indexes. Caller must hold mutex_.
+    void enforce_disk_size_cap_locked();
 
     // Per-conversation caches (conv_hash -> cache instance)
     std::string ssd_base_path_;
     ::kv_ssd_config config_;
     uint64_t model_compat_hash_ = 0;
+    size_t cold_max_size_bytes_ = 0;
     std::unordered_map<uint64_t, std::unique_ptr<kv_ssd_cache>> conv_caches_;
     std::unordered_map<uint64_t, std::unique_ptr<server_ssd_cache>> conv_wrappers_;
 

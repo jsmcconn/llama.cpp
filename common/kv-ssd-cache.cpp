@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <cctype>
 #include <climits>
+#include <cstdlib>
 #include <filesystem>
 #include <fcntl.h>
 
@@ -55,21 +56,36 @@ static uint64_t now_ms() {
 }
 
 // FNV-1a hash for token sequences
+static uint64_t kv_ssd_hash_token_update(uint64_t h, uint32_t v) {
+    h ^= (uint64_t)(v & 0xFF);
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)((v >> 8) & 0xFF);
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)((v >> 16) & 0xFF);
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)((v >> 24) & 0xFF);
+    h *= 1099511628211ULL;
+    return h;
+}
+
 uint64_t kv_ssd_hash_tokens(const uint32_t* tokens, size_t count) {
     if (!tokens || count == 0) return 0;
     uint64_t h = 14695981039346656037ULL;
     for (size_t i = 0; i < count; i++) {
-        uint32_t v = tokens[i];
-        h ^= (uint64_t)(v & 0xFF);
-        h *= 1099511628211ULL;
-        h ^= (uint64_t)((v >> 8) & 0xFF);
-        h *= 1099511628211ULL;
-        h ^= (uint64_t)((v >> 16) & 0xFF);
-        h *= 1099511628211ULL;
-        h ^= (uint64_t)((v >> 24) & 0xFF);
-        h *= 1099511628211ULL;
+        h = kv_ssd_hash_token_update(h, tokens[i]);
     }
     return h;
+}
+
+uint64_t kv_ssd_hash_conversation(
+    const uint32_t* tokens,
+    size_t tokens_size,
+    size_t first_user_end) {
+    if (!tokens || tokens_size == 0) return 0;
+    const size_t stable_count = first_user_end > 0 && first_user_end <= tokens_size
+        ? first_user_end
+        : std::min(tokens_size, (size_t)1024);
+    return kv_ssd_hash_tokens(tokens, stable_count);
 }
 
 
@@ -173,6 +189,33 @@ static bool validate_checksum(const T & hdr, const char * label) {
         return false;
     }
     return true;
+}
+
+static bool record_payload_sizes(
+        const kv_ssd_record & rec,
+        size_t & tgt_size,
+        size_t & dft_size,
+        size_t & spec_size,
+        size_t & total_size) {
+    if (rec.data_size > SIZE_MAX || rec.dft_data_size > SIZE_MAX || rec.spec_data_size > SIZE_MAX) {
+        return false;
+    }
+    tgt_size = (size_t) rec.data_size;
+    dft_size = (size_t) rec.dft_data_size;
+    spec_size = (size_t) rec.spec_data_size;
+    if (dft_size > SIZE_MAX - tgt_size || spec_size > SIZE_MAX - tgt_size - dft_size) {
+        return false;
+    }
+    total_size = tgt_size + dft_size + spec_size;
+    return (rec.payload_size == 0 || rec.payload_size == total_size) &&
+        total_size <= (size_t) (INT64_MAX - (int64_t) sizeof(kv_ssd_record));
+}
+
+static bool record_file_size_matches(int fd, size_t payload_size) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 0) return false;
+    const uint64_t expected = (uint64_t)sizeof(kv_ssd_record) + (uint64_t)payload_size;
+    return (uint64_t)st.st_size == expected;
 }
 
 // A single (pointer, size) segment for scatter-write I/O.
@@ -395,7 +438,11 @@ static bool load_checkpoint_file(kv_ssd_cache* c, const std::string& filepath) {
     // compatible with the v4 reader because the v4 fields overlap
     // the v3 reserved slot and would be read as garbage. Clean
     // miss is the right behavior.
-    if (rec.version != KV_SSD_VERSION) return false;
+    if (rec.version != KV_SSD_VERSION || rec.id == 0 || rec.id == UINT64_MAX ||
+        rec.token_count > KV_SSD_TOKEN_PREFIX_MAX ||
+        rec.data_size > SIZE_MAX || rec.dft_data_size > SIZE_MAX || rec.spec_data_size > SIZE_MAX) {
+        return false;
+    }
     // Header checksum validation. Skip if the writer didn't set one
     // (zero), require a match if it did.
     if (!validate_checksum(rec, filepath.c_str())) return false;
@@ -443,7 +490,16 @@ static bool load_checkpoint_file(kv_ssd_cache* c, const std::string& filepath) {
     }
 
     c->index[rec.id] = ckpt;
-    c->slot_latest[rec.slot_id] = rec.id;
+    auto latest = c->slot_latest.find(rec.slot_id);
+    if (latest == c->slot_latest.end()) {
+        c->slot_latest[rec.slot_id] = rec.id;
+    } else {
+        const auto & previous = c->index.at(latest->second);
+        if (ckpt.turn_created > previous.turn_created ||
+            (ckpt.turn_created == previous.turn_created && rec.id > previous.id)) {
+            latest->second = rec.id;
+        }
+    }
     return true;
 }
 
@@ -456,6 +512,20 @@ static size_t scan_checkpoint_files(kv_ssd_cache* c) {
     size_t loaded = 0;
     for (const auto& entry : fs::directory_iterator(dir)) {
         std::string fname = entry.path().filename().string();
+        if (fname.size() > 4 && fname.compare(fname.size() - 4, 4, ".tmp") == 0) {
+            std::error_code time_ec;
+            const auto modified = fs::last_write_time(entry.path(), time_ec);
+            if (time_ec || modified + std::chrono::minutes(10) >= fs::file_time_type::clock::now()) {
+                continue;
+            }
+            std::error_code cleanup_ec;
+            fs::remove(entry.path(), cleanup_ec);
+            if (cleanup_ec) {
+                LOG_WRN("SSD cache: failed to remove stale temporary file %s: %s\n",
+                        entry.path().string().c_str(), cleanup_ec.message().c_str());
+            }
+            continue;
+        }
         if (fname.size() < 9) continue;
         if (fname.compare(0, 5, "ckpt-") != 0) continue;
         if (fname.compare(fname.size() - 4, 4, ".bin") != 0) continue;
@@ -477,6 +547,49 @@ static bool delete_checkpoint_file(kv_ssd_cache* c, uint64_t id) {
         int se = errno;
         LOG_WRN("SSD cache: failed to delete %s: %s (errno=%d)\n", path.c_str(), strerror(se), se);
         return false;
+    }
+    return true;
+}
+
+// Remove an index entry and any resident blob. Caller must hold c->mutex.
+static bool forget_checkpoint_locked(kv_ssd_cache* c, uint64_t id) {
+    auto ckpt_it = c->index.find(id);
+    if (ckpt_it == c->index.end()) return false;
+
+    auto hot_it = c->hot_cache.find(id);
+    if (hot_it != c->hot_cache.end()) {
+        c->hot_bytes -= hot_it->second.size();
+        c->hot_cache.erase(hot_it);
+    }
+    auto warm_it = c->warm_cache.find(id);
+    if (warm_it != c->warm_cache.end()) {
+        c->warm_bytes -= warm_it->second.size();
+        c->warm_cache.erase(warm_it);
+    }
+    c->index.erase(ckpt_it);
+
+    for (auto latest_it = c->slot_latest.begin(); latest_it != c->slot_latest.end();) {
+        if (latest_it->second != id) {
+            ++latest_it;
+            continue;
+        }
+        const uint32_t slot_id = latest_it->first;
+        uint64_t replacement_id = 0;
+        uint32_t replacement_turn = 0;
+        for (const auto& [candidate_id, candidate] : c->index) {
+            if (candidate.slot_id != slot_id) continue;
+            if (replacement_id == 0 || candidate.turn_created > replacement_turn ||
+                (candidate.turn_created == replacement_turn && candidate_id > replacement_id)) {
+                replacement_id = candidate_id;
+                replacement_turn = candidate.turn_created;
+            }
+        }
+        if (replacement_id != 0) {
+            latest_it->second = replacement_id;
+            ++latest_it;
+        } else {
+            latest_it = c->slot_latest.erase(latest_it);
+        }
     }
     return true;
 }
@@ -518,19 +631,9 @@ static void ring_buffer_evict(kv_ssd_cache* c) {
         auto ckpt_it = c->index.find(id);
         if (ckpt_it == c->index.end()) continue;
 
-        uint32_t slot = ckpt_it->second.slot_id;
-
-        // Remove from slot_latest if this was the latest for that slot
-        auto slot_it = c->slot_latest.find(slot);
-        if (slot_it != c->slot_latest.end() && slot_it->second == id) {
-            c->slot_latest.erase(slot_it);
-        }
-
         // Delete file from disk
         delete_checkpoint_file(c, id);
-
-        // Remove from in-memory index
-        c->index.erase(ckpt_it);
+        forget_checkpoint_locked(c, id);
         evicted++;
     }
 
@@ -618,7 +721,7 @@ static void make_room_hot(kv_ssd_cache* c, size_t needed) {
 }
 
 // Promote a checkpoint to hot tier (load from SSD file if needed).
-static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
+static bool promote_to_hot(kv_ssd_cache* c, uint64_t id, std::vector<uint8_t>* uncached_blob = nullptr) {
     auto it = c->index.find(id);
     if (it == c->index.end()) return false;
 
@@ -643,6 +746,14 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
             size_t sz = data.size();
             c->warm_cache.erase(wit);
             c->warm_bytes -= sz;
+
+            if (sz > c->config.hot_ram_bytes) {
+                ckpt.tier = KV_TIER_COLD;
+                ckpt.last_access = now_ms();
+                ckpt.access_count++;
+                if (uncached_blob) *uncached_blob = std::move(data);
+                return uncached_blob != nullptr;
+            }
 
             make_room_hot(c, sz);
 
@@ -678,7 +789,7 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
     if (fd < 0) {
         LOG_WRN("SSD cache: checkpoint file %s not found\n", filepath.c_str());
         // File was deleted (ring buffer evicted) but index still had entry - clean up
-        c->index.erase(id);
+        forget_checkpoint_locked(c, id);
         return false;
     }
 
@@ -697,7 +808,10 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
         close(fd);
         return false;
     }
-    if (!validate_checksum(rec, "checkpoint")) return false;
+    if (!validate_checksum(rec, "checkpoint")) {
+        close(fd);
+        return false;
+    }
     if (rec.model_identity != 0 && c->model_identity != 0 &&
         rec.model_identity != c->model_identity) {
         LOG_WRN("SSD cache: checkpoint id=%lu model_identity 0x%016llx "
@@ -709,11 +823,23 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
         return false;
     }
 
-    const size_t tgt_size  = (size_t)rec.data_size;
-    const size_t dft_size  = (size_t)rec.dft_data_size;
-    const size_t spec_size = (size_t)rec.spec_data_size;
-    const size_t total_blob = tgt_size + dft_size + spec_size;
-    make_room_hot(c, total_blob);
+    size_t tgt_size = 0;
+    size_t dft_size = 0;
+    size_t spec_size = 0;
+    size_t total_blob = 0;
+    if (!record_payload_sizes(rec, tgt_size, dft_size, spec_size, total_blob)) {
+        LOG_WRN("SSD cache: checkpoint id=%lu has invalid payload sizes\n", (unsigned long) id);
+        close(fd);
+        return false;
+    }
+    if (!record_file_size_matches(fd, total_blob)) {
+        LOG_WRN("SSD cache: checkpoint id=%lu payload length does not match file size\n", (unsigned long) id);
+        close(fd);
+        return false;
+    }
+    if (total_blob <= c->config.hot_ram_bytes) {
+        make_room_hot(c, total_blob);
+    }
 
     // Read all blobs concatenated: [tgt_data][dft_data][spec_data]
     std::vector<uint8_t> data(total_blob);
@@ -727,15 +853,91 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
     ckpt.dft_data_size  = dft_size;
     ckpt.spec_data_size = spec_size;
 
-    c->hot_cache[id] = std::move(data);
-    c->hot_bytes += total_blob;
-    ckpt.tier = KV_TIER_HOT;
     ckpt.last_access = now_ms();
     ckpt.access_count++;
     c->stats_loads++;
 
+    if (total_blob > c->config.hot_ram_bytes) {
+        ckpt.tier = KV_TIER_COLD;
+        if (uncached_blob) *uncached_blob = std::move(data);
+        LOG_INF("SSD cache: loaded oversized checkpoint %lu without RAM pin (%zu MiB, hot limit=%zu MiB)\n",
+                (unsigned long)id, total_blob / 1024 / 1024,
+                c->config.hot_ram_bytes / 1024 / 1024);
+        return uncached_blob != nullptr;
+    }
+
+    c->hot_cache[id] = std::move(data);
+    c->hot_bytes += total_blob;
+    ckpt.tier = KV_TIER_HOT;
+
     LOG_INF("SSD cache: promoted checkpoint %lu cold->hot (%zu MiB)\n",
             (unsigned long)id, total_blob / 1024 / 1024);
+    return true;
+}
+
+// Read a checkpoint that exceeds the hot-tier budget directly into its target,
+// draft, and speculative output vectors. This avoids a second combined payload
+// allocation during native-context restores (roughly 10 GiB for this model).
+// Caller must hold c->mutex.
+static bool load_cold_direct(
+        kv_ssd_cache * c,
+        uint64_t id,
+        std::vector<uint8_t> & out_data,
+        std::vector<uint8_t> * out_dft_data,
+        std::vector<uint8_t> * out_spec_data) {
+    auto it = c->index.find(id);
+    if (it == c->index.end()) return false;
+
+    const std::string filepath = ckpt_path(c, id);
+    int fd = open(filepath.c_str(), O_RDONLY);
+    if (fd < 0) {
+        forget_checkpoint_locked(c, id);
+        return false;
+    }
+
+    kv_ssd_record rec;
+    size_t tgt_size = 0;
+    size_t dft_size = 0;
+    size_t spec_size = 0;
+    size_t total_size = 0;
+    if (!pread_all(fd, &rec, sizeof(rec), 0) ||
+        rec.magic != KV_SSD_MAGIC_REC || rec.version != KV_SSD_VERSION || rec.id != id ||
+        !validate_checksum(rec, "checkpoint") ||
+        !record_payload_sizes(rec, tgt_size, dft_size, spec_size, total_size) ||
+        !record_file_size_matches(fd, total_size) ||
+        (rec.model_identity != 0 && c->model_identity != 0 && rec.model_identity != c->model_identity)) {
+        close(fd);
+        return false;
+    }
+
+    out_data.resize(tgt_size);
+    if (out_dft_data) out_dft_data->resize(dft_size);
+    if (out_spec_data) out_spec_data->resize(spec_size);
+
+    int64_t offset = (int64_t) sizeof(kv_ssd_record);
+    bool ok = pread_all(fd, out_data.data(), tgt_size, offset);
+    offset += (int64_t) tgt_size;
+    if (ok && out_dft_data && dft_size > 0) {
+        ok = pread_all(fd, out_dft_data->data(), dft_size, offset);
+    }
+    offset += (int64_t) dft_size;
+    if (ok && out_spec_data && spec_size > 0) {
+        ok = pread_all(fd, out_spec_data->data(), spec_size, offset);
+    }
+    close(fd);
+    if (!ok) return false;
+
+    auto & checkpoint = it->second;
+    checkpoint.data_size = tgt_size;
+    checkpoint.dft_data_size = dft_size;
+    checkpoint.spec_data_size = spec_size;
+    checkpoint.tier = KV_TIER_COLD;
+    checkpoint.last_access = now_ms();
+    checkpoint.access_count++;
+    c->stats_loads++;
+    LOG_INF("SSD cache: streamed oversized checkpoint %lu directly from SSD (%zu MiB, hot limit=%zu MiB)\n",
+            (unsigned long) id, total_size / 1024 / 1024,
+            c->config.hot_ram_bytes / 1024 / 1024);
     return true;
 }
 
@@ -825,6 +1027,10 @@ kv_ssd_cache* kv_ssd_init(const char* path, const kv_ssd_config* cfg, uint64_t c
 
     // Scan checkpoint files to rebuild in-memory index
     size_t loaded = scan_checkpoint_files(c);
+    for (const auto& [id, checkpoint] : c->index) {
+        (void)checkpoint;
+        c->next_id = std::max(c->next_id, id + 1);
+    }
     LOG_INF("SSD cache: loaded %zu checkpoints from %s (next_id=%lu)\n",
             loaded, c->model_dir.c_str(), (unsigned long)c->next_id);
 
@@ -854,6 +1060,139 @@ void kv_ssd_set_compat_hash(kv_ssd_cache* cache, uint64_t compat_hash) {
     LOG_INF("SSD cache: model compat_hash set to %016" PRIx64 "\n", compat_hash);
 }
 
+static uint64_t checkpoint_file_age_ms(const kv_ssd_cache* cache, uint64_t id) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const auto modified = fs::last_write_time(ckpt_path(cache, id), ec);
+    if (ec) return UINT64_MAX;
+    const auto now_file = fs::file_time_type::clock::now();
+    if (modified >= now_file) return 0;
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        now_file - modified).count();
+}
+
+kv_ssd_store_plan kv_ssd_plan_store(
+    kv_ssd_cache* cache,
+    uint32_t slot_id,
+    int32_t pos_min,
+    int32_t pos_max,
+    uint64_t n_tokens,
+    uint32_t turn_id,
+    const uint32_t* tokens,
+    size_t tokens_size,
+    uint64_t compat_hash,
+    bool has_dft_state,
+    bool has_spec_state) {
+    kv_ssd_store_plan plan;
+    if (!cache || !cache->initialized || !tokens || n_tokens == 0 || tokens_size < n_tokens) {
+        return plan;
+    }
+
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    const size_t prefix_count = std::min((size_t)n_tokens, (size_t)KV_SSD_TOKEN_PREFIX_MAX);
+
+    // Compute all candidate prefix hashes in one token pass. This keeps a
+    // 262K-token plan O(tokens + checkpoints), rather than hashing the prompt
+    // once per durable checkpoint while holding the cache lock.
+    std::vector<size_t> hash_lengths = { (size_t)n_tokens };
+    hash_lengths.reserve(cache->index.size() + 1);
+    for (const auto & [id, checkpoint] : cache->index) {
+        (void)id;
+        if (checkpoint.n_tokens <= n_tokens) hash_lengths.push_back((size_t)checkpoint.n_tokens);
+    }
+    std::sort(hash_lengths.begin(), hash_lengths.end());
+    hash_lengths.erase(std::unique(hash_lengths.begin(), hash_lengths.end()), hash_lengths.end());
+    std::vector<uint64_t> prefix_hashes(hash_lengths.size());
+    uint64_t running_hash = 14695981039346656037ULL;
+    size_t next_length = 0;
+    while (next_length < hash_lengths.size() && hash_lengths[next_length] == 0) {
+        prefix_hashes[next_length++] = 0;
+    }
+    for (size_t i = 0; i < (size_t)n_tokens; ++i) {
+        running_hash = kv_ssd_hash_token_update(running_hash, tokens[i]);
+        while (next_length < hash_lengths.size() && hash_lengths[next_length] == i + 1) {
+            prefix_hashes[next_length++] = running_hash;
+        }
+    }
+    auto incoming_hash = [&](size_t count) {
+        const auto it = std::lower_bound(hash_lengths.begin(), hash_lengths.end(), count);
+        return prefix_hashes[(size_t)(it - hash_lengths.begin())];
+    };
+    const uint64_t token_hash = incoming_hash((size_t)n_tokens);
+
+    uint64_t duplicate_id = 0;
+    uint64_t base_id = 0;
+    uint64_t base_n_tokens = 0;
+    uint32_t base_turn = 0;
+
+    for (auto& [id, checkpoint] : cache->index) {
+        if (compat_hash != 0 && checkpoint.compat_hash != compat_hash) continue;
+        if (cache->model_identity != 0 && checkpoint.model_identity != 0 &&
+            checkpoint.model_identity != cache->model_identity) continue;
+        if (checkpoint.pos_min != pos_min) continue;
+        if ((checkpoint.dft_data_size > 0) != has_dft_state) continue;
+        if ((checkpoint.spec_data_size > 0) != has_spec_state) continue;
+        if (checkpoint.n_tokens > n_tokens) continue;
+        const size_t compare_count = std::min(prefix_count, (size_t)checkpoint.n_tokens);
+        if (checkpoint.token_prefix.size() < compare_count) continue;
+        if (compare_count > 0 &&
+            std::memcmp(checkpoint.token_prefix.data(), tokens, compare_count * sizeof(uint32_t)) != 0) continue;
+        if (checkpoint.token_hash != incoming_hash((size_t)checkpoint.n_tokens)) continue;
+
+        if (checkpoint.n_tokens == n_tokens && checkpoint.token_hash == token_hash &&
+            checkpoint.pos_max == pos_max) {
+            if (duplicate_id == 0 || checkpoint.turn_created > cache->index[duplicate_id].turn_created ||
+                (checkpoint.turn_created == cache->index[duplicate_id].turn_created && id > duplicate_id)) {
+                duplicate_id = id;
+            }
+            continue;
+        }
+
+        if (checkpoint.n_tokens < n_tokens &&
+            (base_id == 0 || checkpoint.n_tokens > base_n_tokens ||
+             (checkpoint.n_tokens == base_n_tokens && checkpoint.turn_created > base_turn))) {
+            base_id = id;
+            base_n_tokens = checkpoint.n_tokens;
+            base_turn = checkpoint.turn_created;
+        }
+    }
+
+    if (duplicate_id != 0) {
+        auto& checkpoint = cache->index[duplicate_id];
+        checkpoint.turn_id = turn_id;
+        checkpoint.last_access = now_ms();
+        checkpoint.access_count++;
+        cache->slot_latest[slot_id] = duplicate_id;
+        plan.action = KV_SSD_STORE_REUSE;
+        plan.checkpoint_id = duplicate_id;
+        plan.base_n_tokens = n_tokens;
+        return plan;
+    }
+
+    const bool growth_enabled = cache->config.durable_min_growth_tokens > 0;
+    const bool age_enabled = cache->config.durable_max_age_ms > 0;
+    if (base_id == 0 || (!growth_enabled && !age_enabled)) {
+        return plan;
+    }
+
+    plan.checkpoint_id = base_id;
+    plan.base_n_tokens = base_n_tokens;
+    plan.growth_tokens = n_tokens - base_n_tokens;
+    plan.age_ms = checkpoint_file_age_ms(cache, base_id);
+    const bool growth_due = growth_enabled &&
+        plan.growth_tokens >= cache->config.durable_min_growth_tokens;
+    const bool age_due = age_enabled && plan.age_ms >= cache->config.durable_max_age_ms;
+    if (!growth_due && !age_due) {
+        plan.action = KV_SSD_STORE_SKIP_CADENCE;
+        auto & checkpoint = cache->index[base_id];
+        checkpoint.turn_id = turn_id;
+        checkpoint.last_access = now_ms();
+        checkpoint.access_count++;
+        cache->slot_latest[slot_id] = base_id;
+    }
+    return plan;
+}
+
 uint64_t kv_ssd_store(kv_ssd_cache* cache,
                   uint32_t slot_id,
                   const uint8_t* data, size_t data_size,
@@ -868,6 +1207,10 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
 
     std::lock_guard<std::mutex> lock(cache->mutex);
 
+    if (cache->next_id == 0 || cache->next_id == UINT64_MAX) {
+        LOG_WRN("SSD cache: checkpoint ID space exhausted\n");
+        return 0;
+    }
     uint64_t id = cache->next_id++;
 
     const size_t checkpoint_tokens = std::min(tokens_size, (size_t)n_tokens);
@@ -929,18 +1272,22 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     // Update index file with new next_id
     write_index_file(cache);
 
-    // Build combined blob: [tgt_data][dft_data][spec_data]
+    // Build a resident combined blob only when the checkpoint fits the hot
+    // budget. Oversized states remain cold; the active slot and kernel page
+    // cache already hold the current data, so pinning another 5-10 GiB copy
+    // would defeat the configured RAM limit.
     const size_t total_blob = data_size + rec.dft_data_size + rec.spec_data_size;
-    make_room_hot(cache, total_blob);
-
-    // Store combined blob in hot cache
-    std::vector<uint8_t> hot_blob;
-    hot_blob.reserve(total_blob);
-    hot_blob.assign(data, data + data_size);
-    if (rec.dft_data_size > 0) hot_blob.insert(hot_blob.end(), dft_data, dft_data + rec.dft_data_size);
-    if (rec.spec_data_size > 0) hot_blob.insert(hot_blob.end(), spec_data, spec_data + rec.spec_data_size);
-    cache->hot_cache[id] = std::move(hot_blob);
-    cache->hot_bytes += total_blob;
+    const bool keep_hot = total_blob <= cache->config.hot_ram_bytes;
+    if (keep_hot) {
+        make_room_hot(cache, total_blob);
+        std::vector<uint8_t> hot_blob;
+        hot_blob.reserve(total_blob);
+        hot_blob.assign(data, data + data_size);
+        if (rec.dft_data_size > 0) hot_blob.insert(hot_blob.end(), dft_data, dft_data + rec.dft_data_size);
+        if (rec.spec_data_size > 0) hot_blob.insert(hot_blob.end(), spec_data, spec_data + rec.spec_data_size);
+        cache->hot_cache[id] = std::move(hot_blob);
+        cache->hot_bytes += total_blob;
+    }
 
     // Build index entry
     kv_ssd_checkpoint ckpt;
@@ -954,13 +1301,16 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     ckpt.token_hash = token_hash;
     ckpt.compat_hash = compat_hash;
     ckpt.token_count = token_count;
-    ckpt.tier = KV_TIER_HOT;
+    ckpt.tier = keep_hot ? KV_TIER_HOT : KV_TIER_COLD;
     if (token_count > 0) {
         ckpt.token_prefix.assign(rec.token_prefix, rec.token_prefix + token_count);
     }
     ckpt.data_size      = data_size;
     ckpt.dft_data_size  = rec.dft_data_size;
     ckpt.spec_data_size = rec.spec_data_size;
+    ckpt.model_identity = rec.model_identity;
+    ckpt.quantization   = rec.quantization;
+    ckpt.model_hash     = rec.model_hash;
     ckpt.last_access = now_ms();
     ckpt.access_count = 1;
 
@@ -969,11 +1319,11 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     cache->stats_stores++;
 
     LOG_INF("SSD cache: stored checkpoint %lu slot=%u tokens=%lu tgt=%zu dft=%llu spec=%llu MiB "
-            "(hot=%zu MiB warm=%zu MiB total=%zu)\n",
+            "tier=%s (hot=%zu MiB warm=%zu MiB total=%zu)\n",
             (unsigned long)id, slot_id, (unsigned long)n_tokens,
             data_size / 1024 / 1024,
             (unsigned long long)(rec.dft_data_size / 1024 / 1024),
-            (unsigned long long)(rec.spec_data_size / 1024 / 1024),
+            (unsigned long long)(rec.spec_data_size / 1024 / 1024), keep_hot ? "hot" : "cold",
             cache->hot_bytes / 1024 / 1024,
             cache->warm_bytes / 1024 / 1024,
             cache->index.size());
@@ -1040,19 +1390,54 @@ bool kv_ssd_load(kv_ssd_cache* cache, uint64_t checkpoint_id,
     // Check warm cache
     auto warm_it = cache->warm_cache.find(checkpoint_id);
     if (warm_it != cache->warm_cache.end()) {
-        auto& ckpt = cache->index[checkpoint_id];
-        split_blob(warm_it->second, ckpt);
-        promote_to_hot(cache, checkpoint_id);
-        cache->stats_hits++;
-        return true;
+        std::vector<uint8_t> uncached_blob;
+        if (promote_to_hot(cache, checkpoint_id, &uncached_blob)) {
+            auto hot = cache->hot_cache.find(checkpoint_id);
+            auto & ckpt = cache->index[checkpoint_id];
+            if (hot != cache->hot_cache.end()) {
+                split_blob(hot->second, ckpt);
+            } else if (!uncached_blob.empty()) {
+                split_blob(uncached_blob, ckpt);
+            } else {
+                cache->stats_misses++;
+                return false;
+            }
+            cache->stats_hits++;
+            return true;
+        }
+        cache->stats_misses++;
+        return false;
     }
 
-    // Load from SSD file and promote to hot
-    if (promote_to_hot(cache, checkpoint_id)) {
+    auto checkpoint_it = cache->index.find(checkpoint_id);
+    if (checkpoint_it != cache->index.end()) {
+        const auto & ckpt = checkpoint_it->second;
+        if (ckpt.data_size <= SIZE_MAX - ckpt.dft_data_size &&
+            ckpt.spec_data_size <= SIZE_MAX - ckpt.data_size - ckpt.dft_data_size &&
+            ckpt.data_size + ckpt.dft_data_size + ckpt.spec_data_size > cache->config.hot_ram_bytes) {
+            if (load_cold_direct(cache, checkpoint_id, out_data, out_dft_data, out_spec_data)) {
+                cache->stats_hits++;
+                return true;
+            }
+            cache->stats_misses++;
+            return false;
+        }
+    }
+
+    // Load from SSD. Oversized checkpoints are returned through a temporary
+    // blob and remain cold instead of violating the hot RAM budget.
+    std::vector<uint8_t> uncached_blob;
+    if (promote_to_hot(cache, checkpoint_id, &uncached_blob)) {
         auto it = cache->hot_cache.find(checkpoint_id);
         if (it != cache->hot_cache.end()) {
             auto& ckpt = cache->index[checkpoint_id];
             split_blob(it->second, ckpt);
+            cache->stats_hits++;
+            return true;
+        }
+        if (!uncached_blob.empty()) {
+            auto& ckpt = cache->index[checkpoint_id];
+            split_blob(uncached_blob, ckpt);
             cache->stats_hits++;
             return true;
         }
@@ -1239,11 +1624,13 @@ void kv_ssd_on_turn_complete(kv_ssd_cache* cache, uint32_t turn_id) {
             cache->index.size());
 }
 
-const kv_ssd_checkpoint* kv_ssd_get_meta(kv_ssd_cache* cache, uint64_t id) {
-    if (!cache || !cache->initialized) return nullptr;
+bool kv_ssd_get_meta(kv_ssd_cache* cache, uint64_t id, kv_ssd_checkpoint& out_meta) {
+    if (!cache || !cache->initialized) return false;
+    std::lock_guard<std::mutex> lock(cache->mutex);
     auto it = cache->index.find(id);
-    if (it == cache->index.end()) return nullptr;
-    return &it->second;
+    if (it == cache->index.end()) return false;
+    out_meta = it->second;
+    return true;
 }
 
 void kv_ssd_get_stats(kv_ssd_cache* cache,
@@ -1278,6 +1665,169 @@ uint32_t kv_ssd_get_max_turn_id(kv_ssd_cache* cache) {
         }
     }
     return max_turn;
+}
+
+bool kv_ssd_forget_checkpoint(kv_ssd_cache* cache, uint64_t checkpoint_id) {
+    if (!cache || checkpoint_id == 0) return false;
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    return forget_checkpoint_locked(cache, checkpoint_id);
+}
+
+size_t kv_ssd_enforce_size_cap(
+    const char* base_path,
+    size_t max_bytes,
+    std::vector<kv_ssd_evicted_checkpoint>* evicted) {
+    namespace fs = std::filesystem;
+    if (!base_path) return 0;
+
+    struct disk_checkpoint {
+        fs::path path;
+        uint64_t cache_key = 0;
+        uint64_t checkpoint_id = 0;
+        size_t size_bytes = 0;
+        int64_t modified_order = 0;
+        bool user_scoped = false;
+        bool protected_newest = false;
+    };
+
+    auto is_hex_key = [](const std::string& name) {
+        return name.size() == 16 &&
+            std::all_of(name.begin(), name.end(), [](unsigned char c) {
+                return std::isxdigit(c) != 0;
+            });
+    };
+    auto checkpoint_id_from_name = [](const std::string& name, uint64_t& id) {
+        if (name.size() < 10 || name.compare(0, 5, "ckpt-") != 0 ||
+            name.compare(name.size() - 4, 4, ".bin") != 0) return false;
+        const std::string number = name.substr(5, name.size() - 9);
+        if (number.empty() || !std::all_of(number.begin(), number.end(), [](unsigned char c) {
+                return std::isdigit(c) != 0;
+            })) return false;
+        char* end = nullptr;
+        id = std::strtoull(number.c_str(), &end, 10);
+        return end && *end == '\0' && id != 0;
+    };
+
+    std::vector<disk_checkpoint> files;
+    size_t total = 0;
+    auto scan_namespace = [&](const fs::path& namespace_path, bool user_scoped) {
+        std::error_code ec;
+        if (!fs::is_directory(namespace_path, ec) || ec) return;
+        fs::directory_iterator dirs(namespace_path, ec);
+        const fs::directory_iterator end;
+        for (; !ec && dirs != end; dirs.increment(ec)) {
+            std::error_code dir_ec;
+            if (!dirs->is_directory(dir_ec) || dir_ec) continue;
+            const std::string dir_name = dirs->path().filename().string();
+            if (!is_hex_key(dir_name)) continue;
+            uint64_t cache_key = 0;
+            if (sscanf(dir_name.c_str(), "%016" SCNx64, &cache_key) != 1) continue;
+
+            std::error_code file_ec;
+            fs::directory_iterator entries(dirs->path(), file_ec);
+            for (; !file_ec && entries != end; entries.increment(file_ec)) {
+                std::error_code regular_ec;
+                if (!entries->is_regular_file(regular_ec) || regular_ec) continue;
+                uint64_t checkpoint_id = 0;
+                if (!checkpoint_id_from_name(entries->path().filename().string(), checkpoint_id)) continue;
+                std::error_code size_ec;
+                const uintmax_t raw_size = entries->file_size(size_ec);
+                if (size_ec || raw_size > SIZE_MAX) continue;
+                std::error_code time_ec;
+                const auto modified = fs::last_write_time(entries->path(), time_ec);
+                const int64_t modified_order = time_ec ? 0 :
+                    (int64_t)modified.time_since_epoch().count();
+                const size_t file_size = (size_t) raw_size;
+                files.push_back({ entries->path(), cache_key, checkpoint_id,
+                                  file_size, modified_order, user_scoped, false });
+                total = file_size > SIZE_MAX - total ? SIZE_MAX : total + file_size;
+            }
+        }
+    };
+
+    const fs::path base(base_path);
+    scan_namespace(base, false);
+    scan_namespace(base / "u", true);
+    if (max_bytes == 0 || total <= max_bytes) return total;
+
+    // Prefer to retain the newest checkpoint in each conversation. If those
+    // checkpoints alone exceed the cap, evict the oldest conversations too;
+    // the newest checkpoint overall remains protected so the cache retains at
+    // least one recovery point whenever a single checkpoint fits the cap.
+    std::unordered_map<std::string, size_t> newest_by_directory;
+    for (size_t i = 0; i < files.size(); ++i) {
+        const std::string directory = files[i].path.parent_path().string();
+        auto it = newest_by_directory.find(directory);
+        if (it == newest_by_directory.end()) {
+            newest_by_directory[directory] = i;
+            continue;
+        }
+        const auto& current = files[it->second];
+        if (files[i].modified_order > current.modified_order ||
+            (files[i].modified_order == current.modified_order &&
+             files[i].checkpoint_id > current.checkpoint_id)) {
+            it->second = i;
+        }
+    }
+    for (const auto& [directory, index] : newest_by_directory) {
+        (void)directory;
+        files[index].protected_newest = true;
+    }
+
+    size_t newest_overall = 0;
+    for (size_t i = 1; i < files.size(); ++i) {
+        if (files[i].modified_order > files[newest_overall].modified_order ||
+            (files[i].modified_order == files[newest_overall].modified_order &&
+             files[i].checkpoint_id > files[newest_overall].checkpoint_id)) {
+            newest_overall = i;
+        }
+    }
+
+    std::vector<size_t> candidates;
+    for (size_t i = 0; i < files.size(); ++i) {
+        if (!files[i].protected_newest) candidates.push_back(i);
+    }
+    auto older_first = [&](size_t a, size_t b) {
+        if (files[a].modified_order != files[b].modified_order) {
+            return files[a].modified_order < files[b].modified_order;
+        }
+        if (files[a].cache_key != files[b].cache_key) {
+            return files[a].cache_key < files[b].cache_key;
+        }
+        return files[a].checkpoint_id < files[b].checkpoint_id;
+    };
+    std::sort(candidates.begin(), candidates.end(), older_first);
+
+    std::vector<size_t> oldest_conversations;
+    for (size_t i = 0; i < files.size(); ++i) {
+        if (files[i].protected_newest && i != newest_overall) oldest_conversations.push_back(i);
+    }
+    std::sort(oldest_conversations.begin(), oldest_conversations.end(), older_first);
+    candidates.insert(candidates.end(), oldest_conversations.begin(), oldest_conversations.end());
+
+    for (size_t index : candidates) {
+        if (total <= max_bytes) break;
+        const auto& file = files[index];
+        std::error_code remove_ec;
+        fs::remove(file.path, remove_ec);
+        if (remove_ec) continue;
+        total = file.size_bytes > total ? 0 : total - file.size_bytes;
+        if (evicted) {
+            evicted->push_back({ file.cache_key, file.checkpoint_id,
+                                 file.size_bytes, file.user_scoped });
+        }
+        LOG_INF("SSD cache: global cap evicted %s checkpoint key=%016" PRIx64
+                " id=%lu size=%zu MiB remaining=%zu MiB cap=%zu MiB\n",
+                file.user_scoped ? "user" : "anonymous", file.cache_key,
+                (unsigned long)file.checkpoint_id, file.size_bytes / 1024 / 1024,
+                total / 1024 / 1024, max_bytes / 1024 / 1024);
+    }
+
+    if (total > max_bytes) {
+        LOG_WRN("SSD cache: global cap remains above target (%zu MiB > %zu MiB) because the newest checkpoint is protected\n",
+                total / 1024 / 1024, max_bytes / 1024 / 1024);
+    }
+    return total;
 }
 
 // =============================================================================

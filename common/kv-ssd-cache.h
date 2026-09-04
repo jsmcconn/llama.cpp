@@ -45,6 +45,11 @@ struct kv_ssd_config {
     // preserve the legacy behavior (auto-size uses raw MemAvailable).
     size_t model_size_bytes  = 0;
     bool no_fsync            = false; // Skip fsync on write (faster, may lose last checkpoint on crash)
+    // Durable-write cadence. Both disabled preserves the legacy behavior of
+    // writing every checkpoint. When enabled, a checkpoint is durable when
+    // either the compatible-prefix growth or wall-clock age reaches its cap.
+    size_t durable_min_growth_tokens = 0;
+    uint64_t durable_max_age_ms      = 0;
     // v4: model identity fields written to the index header and every
     // per-checkpoint header. Used to reject caches whose underlying
     // model no longer matches the on-disk metadata. Set both to 0 to
@@ -52,6 +57,27 @@ struct kv_ssd_config {
     uint64_t model_identity  = 0; // hash(arch, dims, cache types)
     uint64_t model_hash      = 0; // content hash of the GGUF
     uint32_t quantization    = 0; // ggml_type of the primary weight tensor
+};
+
+enum kv_ssd_store_action {
+    KV_SSD_STORE_WRITE = 0,
+    KV_SSD_STORE_REUSE,
+    KV_SSD_STORE_SKIP_CADENCE,
+};
+
+struct kv_ssd_store_plan {
+    kv_ssd_store_action action = KV_SSD_STORE_WRITE;
+    uint64_t checkpoint_id = 0;
+    uint64_t base_n_tokens = 0;
+    uint64_t growth_tokens = 0;
+    uint64_t age_ms = 0;
+};
+
+struct kv_ssd_evicted_checkpoint {
+    uint64_t cache_key = 0;
+    uint64_t checkpoint_id = 0;
+    size_t size_bytes = 0;
+    bool user_scoped = false;
 };
 
 // Checkpoint metadata (in-memory index entry)
@@ -223,6 +249,23 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
                   const uint8_t* dft_data = nullptr, size_t dft_data_size = 0,
                   const uint8_t* spec_data = nullptr, size_t spec_data_size = 0);
 
+// Decide whether a durable checkpoint should be serialized and written.
+// Exact duplicate prompts are reused without serialization. Compatible
+// append-only prompts are rate-limited by the configured growth/time cadence.
+// Branches whose prior durable state is not an exact prefix always write.
+kv_ssd_store_plan kv_ssd_plan_store(
+    kv_ssd_cache* cache,
+    uint32_t slot_id,
+    int32_t pos_min,
+    int32_t pos_max,
+    uint64_t n_tokens,
+    uint32_t turn_id,
+    const uint32_t* tokens,
+    size_t tokens_size,
+    uint64_t compat_hash,
+    bool has_dft_state,
+    bool has_spec_state);
+
 // Load a checkpoint by ID. Reads ckpt-{id}.bin and promotes to hot tier.
 // out_dft_data and out_spec_data receive the optional extra blobs if non-null.
 // Returns true and copies data to out_data on success.
@@ -254,8 +297,8 @@ uint64_t kv_ssd_find_by_slot(kv_ssd_cache* cache,
 // Notify turn completion. Triggers tier demotion and ring buffer pruning.
 void kv_ssd_on_turn_complete(kv_ssd_cache* cache, uint32_t turn_id);
 
-// Get checkpoint metadata (returns nullptr if not found).
-const kv_ssd_checkpoint* kv_ssd_get_meta(kv_ssd_cache* cache, uint64_t id);
+// Copy checkpoint metadata while holding the cache lock.
+bool kv_ssd_get_meta(kv_ssd_cache* cache, uint64_t id, kv_ssd_checkpoint& out_meta);
 
 // Set model compatibility hash for config validation on load.
 void kv_ssd_set_compat_hash(kv_ssd_cache* cache, uint64_t compat_hash);
@@ -267,6 +310,28 @@ void kv_ssd_get_stats(kv_ssd_cache* cache,
                       uint64_t* hits, uint64_t* misses);
 // Get the maximum turn_id across all existing checkpoints.
 uint32_t kv_ssd_get_max_turn_id(kv_ssd_cache* cache);
+
+// Remove an entry from an already loaded cache after a global filesystem
+// eviction. The checkpoint file is assumed to have been removed already.
+bool kv_ssd_forget_checkpoint(kv_ssd_cache* cache, uint64_t checkpoint_id);
+
+// Enforce a real on-disk byte cap across anonymous and user-scoped caches.
+// Every ckpt-*.bin file counts regardless of its in-process tier. Eviction is
+// oldest-checkpoint-first while preserving the newest file in each directory.
+// Returns the number of bytes remaining after eviction and reports removed
+// loaded-cache identities through `evicted`.
+size_t kv_ssd_enforce_size_cap(
+    const char* base_path,
+    size_t max_bytes,
+    std::vector<kv_ssd_evicted_checkpoint>* evicted = nullptr);
+
+// Stable anonymous conversation hash. If first_user_end is valid, hash the
+// complete stable prefix through the first user message; otherwise retain the
+// legacy first-1024-token behavior.
+uint64_t kv_ssd_hash_conversation(
+    const uint32_t* tokens,
+    size_t tokens_size,
+    size_t first_user_end = 0);
 
 // Scan all conversation directories for a fuzzy prefix match.
 // Only considers directories with matching compat_hash (model config).

@@ -242,12 +242,30 @@ static void test_global_turn_scan_includes_user_namespace() {
     assert(kv_ssd_get_max_turn_id_global(base.c_str()) == 0);
 }
 
+static void test_conversation_hash_includes_first_user_message() {
+    std::vector<uint32_t> prompt_a(1400, 7);
+    std::vector<uint32_t> prompt_b = prompt_a;
+    // The shared system prefix is longer than the legacy 1024-token hash.
+    // Distinct first-user content begins afterwards.
+    for (size_t i = 1200; i < prompt_a.size(); ++i) {
+        prompt_a[i] = 1000 + (uint32_t)i;
+        prompt_b[i] = 2000 + (uint32_t)i;
+    }
+    assert(kv_ssd_hash_conversation(prompt_a.data(), prompt_a.size(), 0) ==
+           kv_ssd_hash_conversation(prompt_b.data(), prompt_b.size(), 0));
+    assert(kv_ssd_hash_conversation(prompt_a.data(), prompt_a.size(), prompt_a.size()) !=
+           kv_ssd_hash_conversation(prompt_b.data(), prompt_b.size(), prompt_b.size()));
+    assert(kv_ssd_hash_conversation(prompt_a.data(), prompt_a.size(), prompt_a.size()) ==
+           kv_ssd_hash_conversation(prompt_a.data(), prompt_a.size(), prompt_a.size()));
+}
+
 int main() {
     test_isolated_directories();
     test_no_cross_user_lookups();
     test_namespace_hash_stability();
     test_atomic_index_persistence();
     test_global_turn_scan_includes_user_namespace();
+    test_conversation_hash_includes_first_user_message();
     std::printf("kv-ssd-user-isolation: all tests passed\n");
     return 0;
 }

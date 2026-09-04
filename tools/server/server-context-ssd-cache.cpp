@@ -12,6 +12,19 @@
 
 namespace llama {
 
+kv_ssd_store_plan server_ssd_cache::plan_store(
+    uint32_t slot_id,
+    struct llama_context* ctx_dft,
+    const common_prompt_checkpoint& ckpt,
+    const llama_token* tokens,
+    size_t tokens_size,
+    uint32_t turn_id) {
+    return kv_ssd_plan_store(
+        cache_, slot_id, ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, turn_id,
+        (const uint32_t*)tokens, tokens_size, cache_ ? cache_->compat_hash : 0,
+        ctx_dft != nullptr, !ckpt.data_spec.empty());
+}
+
 uint64_t server_ssd_cache::store(uint32_t slot_id,
                                  struct llama_context* ctx,
                                  struct llama_context* ctx_dft,
@@ -68,12 +81,12 @@ bool server_ssd_cache::load(uint64_t checkpoint_id,
 {
     if (!cache_ || !ctx || checkpoint_id == 0) return false;
 
-    const kv_ssd_checkpoint* meta = kv_ssd_get_meta(cache_, checkpoint_id);
-    if (!meta) return false;
+    kv_ssd_checkpoint meta;
+    if (!kv_ssd_get_meta(cache_, checkpoint_id, meta)) return false;
 
     // Use the caller-supplied destination seq_id (current slot's id) when provided.
     // Falls back to meta->slot_id for same-slot loads where they are guaranteed equal.
-    const uint32_t seq_id = (dest_seq_id != UINT32_MAX) ? dest_seq_id : meta->slot_id;
+    const uint32_t seq_id = (dest_seq_id != UINT32_MAX) ? dest_seq_id : meta.slot_id;
 
     std::vector<uint8_t> tgt_data;
     std::vector<uint8_t> dft_data;
@@ -99,9 +112,9 @@ bool server_ssd_cache::load(uint64_t checkpoint_id,
         *out_spec_data = std::move(spec_data);
     }
 
-    out_pos_min  = meta->pos_min;
-    out_pos_max  = meta->pos_max;
-    out_n_tokens = meta->n_tokens;
+    out_pos_min  = meta.pos_min;
+    out_pos_max  = meta.pos_max;
+    out_n_tokens = meta.n_tokens;
     return true;
 }
 

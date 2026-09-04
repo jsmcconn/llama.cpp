@@ -187,6 +187,15 @@ struct common_chat_msg_spans {
         }
         return -1;
     }
+
+    size_t first_user_message_end() const {
+        for (const auto & span : spans) {
+            if (span.role == COMMON_CHAT_ROLE_USER) {
+                return span.pos + span.len;
+            }
+        }
+        return 0;
+    }
 };
 
 struct common_chat_msg_delimiter {

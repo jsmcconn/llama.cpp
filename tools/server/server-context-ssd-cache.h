@@ -39,6 +39,13 @@ public:
                    size_t tokens_size,
                    uint32_t turn_id);
 
+    kv_ssd_store_plan plan_store(uint32_t slot_id,
+                                 struct llama_context* ctx_dft,
+                                 const common_prompt_checkpoint& ckpt,
+                                 const llama_token* tokens,
+                                 size_t tokens_size,
+                                 uint32_t turn_id);
+
     // Load a checkpoint by ID. Restores via llama_state_seq_set_data_ext.
     // ctx_dft receives the MTP/draft context state if it was stored (may be nullptr).
     // out_spec_data receives the speculative impl state (pending_h etc.) if stored.
