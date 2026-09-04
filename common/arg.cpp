@@ -1733,7 +1733,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum host-memory prompt cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
-            " -- only useful with --parallel > 1; with a single slot the save+load round-trip is a no-op."
             " [(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
             params.cache_ram_mib = value;

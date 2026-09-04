@@ -42,6 +42,23 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+static bool server_tokens_is_strong_continuation(
+        const server_tokens & cached,
+        const server_tokens & incoming) {
+    if (cached.empty() || incoming.empty()) {
+        return false;
+    }
+
+    if (cached.has_media() != incoming.has_media()) {
+        return false;
+    }
+
+    const size_t common_prefix = cached.get_common_prefix(incoming);
+    const size_t shorter = std::min(cached.size(), incoming.size());
+
+    return shorter > 0 && common_prefix * 10 >= shorter * 9;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -1483,18 +1500,6 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
-
-            // The host-memory prompt cache is only useful when multiple
-            // slots are configured. With n_parallel == 1 there is exactly
-            // one slot, so the save+load round-trip in get_available_slot
-            // runs back-to-back on the same slot and the cache can never
-            // accumulate state. The guard in get_available_slot() skips
-            // the round-trip in that case (a no-op), but the memory is
-            // still reserved. Warn the user so the explicit setting is
-            // visible.
-            if (params_base.n_parallel <= 1) {
-                SRV_WRN("%s\n", "--cache-ram is a no-op with a single slot (the prompt cache cannot accumulate state when the only slot is also the one being saved+loaded). Use --parallel > 1 for cross-task prompt cache reuse, or pass --cache-ram 0 to silence this warning.");
-            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1786,11 +1791,13 @@ private:
         // session starts fresh instead of being corrupted by stale context.
         uint64_t task_conv_hash = 0;
         {
-            const auto & task_tokens = task.tokens.get_tokens();
-            if (!task_tokens.empty()) {
-                size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
-                task_conv_hash = kv_ssd_hash_tokens(
-                    (const uint32_t *)task_tokens.data(), hash_len);
+            if (!task.tokens.has_media()) {
+                const auto & task_tokens = task.tokens.get_tokens();
+                if (!task_tokens.empty()) {
+                    size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
+                    task_conv_hash = kv_ssd_hash_tokens(
+                        (const uint32_t *)task_tokens.data(), hash_len);
+                }
             }
         }
 
@@ -1845,13 +1852,16 @@ private:
                     continue;
                 }
 
-                // Skip slots belonging to a different conversation. When the
-                // slot's conv_hash (from a previous task) doesn't match the
-                // incoming task's conv_hash, this is a new session — reusing
-                // the old KV cache would corrupt the new conversation with
-                // stale context. The slot will be recovered via LRU fallback
-                // and cleared in the cache-update block below.
-                if (slot.conv_hash != 0 && slot.conv_hash != task_conv_hash) {
+                if (tokens.has_media() != task.tokens.has_media()) {
+                    continue;
+                }
+
+                // A continuation can append tokens to the cached prompt,
+                // changing the first-1024-token hash without crossing a real
+                // conversation boundary. Preserve the hash guard for unrelated
+                // prompts, but allow a strong LCP continuation through it.
+                const bool strong_continuation = server_tokens_is_strong_continuation(tokens, task.tokens);
+                if (slot.conv_hash != 0 && slot.conv_hash != task_conv_hash && !strong_continuation) {
                     SLT_DBG(slot, "LCP match rejected: conv_hash mismatch (slot=0x%016lx task=0x%016lx) - different conversation\n",
                             (unsigned long)slot.conv_hash, (unsigned long)task_conv_hash);
                     continue;
@@ -2023,22 +2033,6 @@ private:
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
-            // With a single slot (n_parallel <= 1), the host-memory prompt
-            // cache cannot accumulate state between requests: the only slot
-            // in the system is the one we just selected, and the save+load
-            // round-trip below is back-to-back in this same call, so the
-            // just-saved entry is immediately consumed by prompt_load() and
-            // the cache ends up empty. Each turn still pays the cost of
-            // copying 0.9-2.6 GiB of state out of VRAM and back in for no
-            // benefit. Skip the round-trip when there is no other slot for
-            // the cache to hold entries for. The in-memory checkpoint ring
-            // (slot.prompt.checkpoints) and the SSD page manager already
-            // cover the same use case for the common single-slot workloads.
-            if (update_cache && params_base.n_parallel <= 1) {
-                SRV_TRC("%s", "skipping prompt cache update (n_parallel <= 1, cache cannot hold state between back-to-back save+load on the same slot)\n");
-                update_cache = false;
-            }
-
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
@@ -2051,7 +2045,8 @@ private:
                 // clear the KV cache + prompt so prompt_load() searches for
                 // a match from the NEW session instead of restoring stale
                 // context from the previous conversation.
-                if (!session_reset && ret->conv_hash != 0 && ret->conv_hash != task_conv_hash) {
+                if (!session_reset && ret->conv_hash != 0 && ret->conv_hash != task_conv_hash &&
+                    !server_tokens_is_strong_continuation(ret->prompt.tokens, task.tokens)) {
                     session_reset = true;
                 }
 
@@ -2278,10 +2273,14 @@ private:
         // stale context from the previous one.
         uint64_t task_conv_hash = 0;
         {
-            const auto & task_tokens = slot.task->tokens.get_tokens();
-            size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
-            task_conv_hash = kv_ssd_hash_tokens(
-                (const uint32_t *)task_tokens.data(), hash_len);
+            if (!slot.task->tokens.has_media()) {
+                const auto & task_tokens = slot.task->tokens.get_tokens();
+                if (!task_tokens.empty()) {
+                    size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
+                    task_conv_hash = kv_ssd_hash_tokens(
+                        (const uint32_t *)task_tokens.data(), hash_len);
+                }
+            }
         }
 
         // Detect conversation boundary: if the slot already has a conv_hash
@@ -2297,7 +2296,9 @@ private:
         // slot on small embedding models). needs_session_reset still fires
         // so error/recovery paths are unaffected.
         const bool stateless = (slot.task->type == SERVER_TASK_TYPE_EMBEDDING);
-        const bool conv_boundary = !stateless && slot.conv_hash != 0 && slot.conv_hash != task_conv_hash;
+        const bool conv_boundary = !stateless && !slot.task->tokens.has_media() &&
+            slot.conv_hash != 0 && slot.conv_hash != task_conv_hash &&
+            !server_tokens_is_strong_continuation(slot.prompt.tokens, slot.task->tokens);
         if (slot.needs_session_reset || conv_boundary) {
             if (!slot.needs_session_reset) {
                 SLT_INF(slot, "conversation boundary detected (conv_hash: slot=0x%016lx task=0x%016lx) - purging KV cache and prompt for new session\n",
