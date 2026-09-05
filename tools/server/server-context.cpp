@@ -2160,6 +2160,23 @@ private:
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
 
+            // Session boundary / slot-shrink guard: when session_reset was set
+            // (by conv_hash mismatch, low f_keep, or our slot-shrink guard
+            // above) and we did NOT run the cache update (n_parallel <= 1
+            // path or cache disabled), still drop the slot's KV cache and
+            // prompt tokens so launch_slot_with_task does a fresh prefill.
+            // Without this, n_parallel=1 sessions skip prompt_clear() entirely
+            // and the slot is reused with the stale state intact.
+            //
+            // Note: needs_session_reset is set so launch_slot_with_task can
+            // skip its own redundant prompt_clear().
+            if (session_reset && ret->prompt.tokens.size() > 0) {
+                SLT_INF(*ret, "session_reset outside cache update: clearing stale KV cache (conv_hash slot=0x%016lx task=0x%016lx, slot_tokens=%zu)\n",
+                        (unsigned long)ret->conv_hash, (unsigned long)task_conv_hash, ret->prompt.tokens.size());
+                ret->prompt_clear();
+                ret->needs_session_reset = true;
+            }
+
             // Per-user concurrency accounting: only count tasks that bind
             // a real user_id (anonymous requests don't participate in the
             // cap; they're throttled by the global n_parallel pool).
