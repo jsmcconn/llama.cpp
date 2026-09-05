@@ -1984,6 +1984,56 @@ private:
                 if (f_keep < 1.0f) {
                     update_cache = true;
                 }
+
+                // Slot-shrink guard: when the LCP matches the entire new task
+                // (sim_best >= 0.999, i.e. the new prompt is a strict prefix of
+                // the slot's stored prompt) but the slot has substantially more
+                // tokens beyond the LCP, the conversation has been trimmed by
+                // the client (e.g. CLIO's auto-shrink on a long session). The
+                // slot's KV cache and recurrent R/S state for positions beyond
+                // the LCP are about to be seq_rm'd, but the model attends to
+                // positions 0..n_past with state inherited from the prior
+                // conversation's run on those tokens. On hybrid MoE/SSM models
+                // (qwen35moe, qwen4exp, etc.) the recurrent state at the LCP
+                // boundary comes from processing the OLD conversation's flow,
+                // not a fresh run on the new conversation's flow, and the
+                // forced-bootstrap token (1 token when LCP == task.n_tokens)
+                // does not update the recurrent state enough to recover.
+                // Symptom: model generates unrelated training-corpus snippets
+                // (Chinese SQL, court opinions, Stack Overflow answers) in
+                // reasoning_content with empty content. Fires regardless of
+                // user_id/conv_hash match (same_session gate above is bypassed
+                // by this guard because it is a state-integrity bug, not a
+                // conversation-boundary bug). Force session_reset so the
+                // existing prompt_clear() path drops the slot's KV cache
+                // and the next launch_slot_with_task does a fresh prefill.
+                //
+                // Threshold: only fire when the shrink is substantial (> 64
+                // tokens). Tiny shrinks (1-2 tokens from a trailing newline
+                // or whitespace tweak) are not worth a 60+ second re-prefill.
+                if (!session_reset) {
+                    const int slot_tokens = ret->prompt.tokens.size();
+                    const int task_tokens = (int) task.tokens.size();
+                    const int common_prefix = ret->prompt.tokens.get_common_prefix(task.tokens);
+                    // sim_best == 1.0 exactly only when the new task is a strict
+                    // prefix of the slot. >= 0.999 catches float-edge cases
+                    // where the division is one ULP short of 1.0.
+                    if (sim_best >= 0.999f && task_tokens < slot_tokens &&
+                        common_prefix == task_tokens &&
+                        slot_tokens - task_tokens > 64) {
+                        SLT_WRN(*ret, "slot-shrink guard: forcing session_reset "
+                                "(slot_tokens=%d, task_tokens=%d, common_prefix=%d, "
+                                "f_keep=%.3f, sim_best=%.3f). The new prompt is a "
+                                "strict prefix of the slot's stored prompt; the "
+                                "slot's recurrent R/S state beyond the LCP "
+                                "boundary is from the prior conversation's run "
+                                "and will corrupt the hybrid model's generation. "
+                                "Forcing prompt_clear() to drop the slot and do a "
+                                "fresh prefill on the next launch_slot_with_task.\n",
+                                slot_tokens, task_tokens, common_prefix, f_keep, sim_best);
+                        session_reset = true;
+                    }
+                }
             }
         }
 
