@@ -86,12 +86,18 @@ add_library(${TARGET}
     llguidance.cpp
     log.cpp
     log.h
+    host-ram.cpp
+    host-ram.h
     ngram-cache.cpp
     ngram-cache.h
     ngram-map.cpp
     ngram-map.h
     ngram-mod.cpp
     ngram-mod.h
+    kv-ssd-cache.cpp
+    kv-ssd-cache.h
+    kv-ssd-system-cache.cpp
+    kv-ssd-system-cache.h
     peg-parser.cpp
     peg-parser.h
     preset.cpp
@@ -130,6 +136,7 @@ set_target_properties(${TARGET} PROPERTIES
 
 target_include_directories(${TARGET} PUBLIC .)
 target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
+target_link_libraries     (${TARGET} PUBLIC vendor::hash)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (LLAMA_SUBPROCESS)

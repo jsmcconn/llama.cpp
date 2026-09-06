@@ -68,6 +68,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Min chunk size to attempt reusing from the cache via KV shifting. See --cache-reuse arg"));
 
+    add((new field_num("prompt_stable_prefix_tokens", params.prompt_stable_prefix_tokens))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Per-request: number of leading prompt tokens that form a stable prefix (e.g. system prompt + thread_summary). The LCP matcher rejects any slot whose stored prompt does not share this prefix. 0 = disabled (legacy behavior)."));
+
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
 

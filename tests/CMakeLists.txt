@@ -150,6 +150,7 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
+llama_build(test-seq-rm-attn-only.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -217,6 +218,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    llama_test(
+        test-seq-rm-attn-only
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-seq-rm-attn-only PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
 
@@ -290,6 +300,23 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
+llama_build_and_test(test-kv-ssd-user-isolation.cpp)
+llama_build_and_test(test-ssd-cache-caps.cpp)
+llama_build_and_test(test-ssd-cache-continuation.cpp)
+llama_build_and_test(test-ssd-cache-prefix-match.cpp)
+# Test-only wrappers in src/llama-moe-residency.h are declared LLAMA_API,
+# so this test links against libllama directly and runs on all platforms
+# including Windows+shared. Exercises the platform-agnostic madvise shim
+# (real madvise on Linux, PrefetchVirtualMemory/VirtualUnlock on Windows).
+llama_build_and_test(test-madvise-shim.cpp)
+target_include_directories(test-madvise-shim PRIVATE ${PROJECT_SOURCE_DIR}/src)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # disabled on Windows because it uses internal functions not exported with LLAMA_API (when building with shared libraries)
+    llama_build_and_test(test-moe-residency-routing.cpp)
+    target_include_directories(test-moe-residency-routing PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_sources(test-moe-residency-routing PRIVATE ${PROJECT_SOURCE_DIR}/src/llama-moe-residency.cpp)
+    target_link_libraries(test-moe-residency-routing PRIVATE llama)
+endif()
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
@@ -376,4 +403,11 @@ llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
+endif()
+
+llama_build_and_test(test-recurrent-checkpoint-boundary.cpp)
+if (LLAMA_BUILD_SERVER AND LLAMA_BUILD_TOOLS)
+    llama_build_and_test(test-server-cache-identity.cpp)
+    target_include_directories(test-server-cache-identity PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-cache-identity PRIVATE server-context)
 endif()

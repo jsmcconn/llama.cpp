@@ -1715,13 +1715,175 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-near-end"},
+        {"--no-checkpoint-near-end"},
+        string_format("force a checkpoint within the last ubatch of every prompt, regardless of --checkpoint-min-step (default: %s)",
+            params.checkpoint_near_end ? "on" : "off"),
+        [](common_params & params, bool value) {
+            params.checkpoint_near_end = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-cpent", "--checkpoint-every-n-tokens"}, "N",
+        string_format("create a checkpoint every n tokens during prefill (processing), -1 to disable (default: %d)", params.checkpoint_every_nt),
+        [](common_params & params, int value) {
+            params.checkpoint_every_nt = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_EVERY_N_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
-        string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
-            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
+        string_format("set the maximum host-memory prompt cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
+            " [(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"-ssd", "--cache-ssd"}, "PATH",
+        "enable SSD-backed KV cache with path to storage directory",
+        [](common_params & params, const std::string & value) {
+            params.cache_ssd_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-ssd-cp", "--cache-ssd-checkpoints"}, "N",
+        string_format("max number of SSD-backed checkpoints per slot (default: %d)", params.cache_ssd_max_checkpoints),
+        [](common_params & params, int value) {
+            params.cache_ssd_max_checkpoints = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-ssd-hot", "--cache-ssd-hot-window"}, "N",
+        string_format("always-keep window size in tokens for SSD cache (default: %zu)", params.cache_ssd_hot_window_tokens),
+        [](common_params & params, int value) {
+            params.cache_ssd_hot_window_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_HOT_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-ssd-warm", "--cache-ssd-warm-window"}, "N",
+        string_format("keep-in-RAM window size in tokens for SSD cache (default: %zu)", params.cache_ssd_warm_window_tokens),
+        [](common_params & params, int value) {
+            params.cache_ssd_warm_window_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_WARM_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-ssd-mc", "--cache-ssd-max-cold"}, "N",
+        string_format("max cold tier checkpoints before oldest-first eviction (default: %d, 0=unlimited)", params.cache_ssd_max_cold),
+        [](common_params & params, int value) {
+            params.cache_ssd_max_cold = value;
+        }
+   ).set_env("LLAMA_ARG_CACHE_SSD_MAX_COLD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-prefix-checkpoints"}, "N",
+        "prefer retaining N shared system/tool-prefix checkpoints within SSD caps (0..3, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 3) {
+                throw std::invalid_argument("invalid value for --cache-ssd-prefix-checkpoints: must be 0..3");
+            }
+            params.cache_ssd_prefix_checkpoints = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_PREFIX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-ssd-hot-ram", "--cache-ssd-hot-ram"}, "N",
+        string_format("hot tier RAM budget in MiB for SSD cache (default: auto-size, 0=auto)"),
+        [](common_params & params, int value) {
+            params.cache_ssd_hot_ram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_HOT_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-ssd-warm-ram", "--cache-ssd-warm-ram"}, "N",
+        string_format("warm tier RAM budget in MiB for SSD cache (default: auto-size, 0=auto)"),
+        [](common_params & params, int value) {
+            params.cache_ssd_warm_ram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_WARM_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-max-conversations"}, "N",
+        string_format("max conversation directories (default: %d, 0=unlimited)", params.cache_ssd_max_conversations),
+        [](common_params & params, int value) {
+            params.cache_ssd_max_conversations = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_MAX_CONVERSATIONS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-cold-maxsize"}, "N",
+        string_format("global cap on all SSD checkpoint files across all conversations in MiB (default: %lld, 0=unlimited)",
+            (long long)params.cache_ssd_cold_max_size_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value for --cache-ssd-cold-maxsize: must be >= 0");
+            }
+            params.cache_ssd_cold_max_size_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_COLD_MAXSIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-durable-min-growth"}, "N",
+        string_format("minimum compatible-prefix token growth between durable SSD checkpoints (default: %d, 0=disabled)",
+            params.cache_ssd_durable_min_growth),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value for --cache-ssd-durable-min-growth: must be >= 0");
+            }
+            params.cache_ssd_durable_min_growth = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_DURABLE_MIN_GROWTH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-durable-max-age"}, "N",
+        string_format("maximum seconds between durable SSD checkpoints for a compatible prompt (default: %d, 0=disabled)",
+            params.cache_ssd_durable_max_age),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value for --cache-ssd-durable-max-age: must be >= 0");
+            }
+            params.cache_ssd_durable_max_age = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_DURABLE_MAX_AGE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-auto-user"},
+        {"--no-cache-ssd-auto-user"},
+        string_format("derive stable content-based cache IDs through the first user message when llama_user_id is absent; intended for single-tenant servers because identical first turns share a namespace (default: %s)",
+            params.cache_ssd_auto_user ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.cache_ssd_auto_user = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_AUTO_USER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prompt-max"}, "N",
+        string_format("max system prompt cache entries (default: %d, 0=disabled)", params.prompt_cache_max),
+        [](common_params & params, int value) {
+            params.prompt_cache_max = value;
+        }
+    ).set_env("LLAMA_ARG_PROMPT_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-system-prompts"}, "N",
+        string_format("max global system prompt entries cached for reuse across conversations (default: %d, 0=disabled)", params.cache_ssd_system_prompts),
+        [](common_params & params, int value) {
+            params.cache_ssd_system_prompts = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_SYSTEM_PROMPTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-system-max-days"}, "N",
+        string_format("expire system prompt cache entries unused for N days (default: %d, 0=never)", params.cache_ssd_system_max_days),
+        [](common_params & params, int value) {
+            params.cache_ssd_system_max_days = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_SYSTEM_MAX_DAYS").set_examples({LLAMA_EXAMPLE_SERVER}));
+   add_opt(common_arg(
+        {"-ssd-ps", "--cache-ssd-page-size"}, "N",
+        string_format("tokens per page for SSD cache: 512, 1024, 2048 (default: %zu)", params.cache_ssd_page_size_tokens),
+        [](common_params & params, int value) {
+            if (value != 512 && value != 1024 && value != 2048) {
+                throw std::invalid_argument("invalid page size, must be 512, 1024, or 2048");
+            }
+            params.cache_ssd_page_size_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_PAGE_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-no-fsync"},
+        string_format("skip fsync on SSD checkpoint writes (default: %s)", params.cache_ssd_no_fsync ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.cache_ssd_no_fsync = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
@@ -2562,6 +2724,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_N_PARALLEL"));
     }
     add_opt(common_arg(
+        {"--max-concurrent-per-user"}, "N",
+        string_format("per-user_id concurrency cap on in-flight slots (default: %d, 0 = unlimited). also applies to the _anonymous bucket.",
+                      params.max_concurrent_per_user),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: max-concurrent-per-user must be >= 0\n");
+            }
+            params.max_concurrent_per_user = value;
+        }
+    ).set_env("LLAMA_ARG_MAX_CONCURRENT_PER_USER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-ns", "--sequences"}, "N",
         string_format("number of sequences to decode (default: %d)", params.n_sequences),
         [](common_params & params, int value) {
@@ -2733,6 +2906,60 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
+    add_opt(common_arg(
+        {"-moe-res", "--moe-expert-residency"},
+        {"-nmoe-res", "--no-moe-expert-residency"},
+        string_format("enable MoE expert residency tracking (reduces physical memory pressure of MoE models via madvise). "
+                      "Requires --load-mode mmap. (default: %s)", params.moe_expert_residency ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_expert_residency = value;
+            if (value && params.load_mode != LLAMA_LOAD_MODE_MMAP) {
+                fprintf(stderr, "warning: --moe-expert-residency requires --load-mode mmap; ignoring\n");
+                params.moe_expert_residency = false;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_RESIDENCY"));
+    add_opt(common_arg(
+        {"-moe-res-k", "--moe-resident-per-layer"}, "N",
+        string_format("max experts kept hot per MoE layer (default: %d)", params.moe_resident_per_layer),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("must be positive");
+            }
+            params.moe_resident_per_layer = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_RESIDENT_PER_LAYER"));
+    add_opt(common_arg(
+        {"-moe-pwk", "--moe-prewarm-top-k"}, "N",
+        string_format("experts to prewarm per layer at startup (default: %d)", params.moe_residency_top_k),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("must be >= 0");
+            }
+            params.moe_residency_top_k = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREWARM_TOP_K"));
+    add_opt(common_arg(
+        {"--moe-residency-debug"}, "[on|off]",
+        "periodically sample each tracked expert's pages via mincore() "
+        "and log the physical residency ratio alongside the software "
+        "policy state. Linux only. (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value))       params.moe_residency_debug = true;
+            else if (is_falsey(value))  params.moe_residency_debug = false;
+            else throw std::invalid_argument("invalid value");
+        }
+    ).set_env("LLAMA_ARG_MOE_RESIDENCY_DEBUG"));
+    add_opt(common_arg(
+        {"-moe-rdint", "--moe-residency-debug-interval"}, "N",
+        "decodes between mincore() samples (default: %d)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("must be positive");
+            }
+            params.moe_residency_debug_interval = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_RESIDENCY_DEBUG_INTERVAL"));
     add_opt(common_arg(
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
