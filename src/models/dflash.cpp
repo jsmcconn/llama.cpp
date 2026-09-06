@@ -220,6 +220,27 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
 
+        // Optional attention output gate (Laguna drafters). Per-head or
+        // per-element, distinguished by the stored width, same as the Laguna
+        // target arch. Absent on generic DFlash drafters. Loaded
+        // opportunistically: no decoder_laguna flag in models.h, so detect
+        // from the GGUF tensor presence instead of decoder_arch.
+        {
+            const ggml_tensor * gate_meta = ml->get_tensor_meta(
+                tn(LLM_TENSOR_ATTN_GATE, "weight", i).str().c_str());
+            if (gate_meta != nullptr) {
+                const int64_t n_gate_out = gate_meta->ne[1];
+                if (n_gate_out != n_head && n_gate_out != n_embd_head_k * n_head) {
+                    GGML_ABORT("DFlash: unexpected attention gate width %lld at layer %d "
+                            "(expected %lld per-head or %lld per-element)",
+                            (long long) n_gate_out, i, (long long) n_head,
+                            (long long) (n_embd_head_k * n_head));
+                }
+                layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i),
+                        { n_embd, n_gate_out }, 0);
+            }
+        }
+
         // optional per-head attention sinks (e.g. Nemotron DSpark)
         layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), { n_head }, TENSOR_NOT_REQUIRED);
 
@@ -622,6 +643,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
 
+            // NVFP4 scales (upstream #28000): pass to build_lora_mm for per-row dequant.
             ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s);
             ggml_tensor * Vcur = build_lora_mm(layer.wv, inp_g, layer.wv_s);
 
@@ -723,9 +745,35 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(Vcur, "Vcur", il);
 
         // cache-aware, non-causal attention
+        // With a gate present, o_proj is deferred until after gating.
+        const bool    gated = layer.wqkv_gate != nullptr;
+        ggml_tensor * wo    = gated ? NULL : layer.wo;
+
         ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+            ? build_attn(inp_attn_iswa, wo,      NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
+            : build_attn(inp_attn,      wo,      NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+
+        if (gated) {
+            // Softplus output gate on the pre-attention hidden state, per-head
+            // (broadcast over head_dim) or per-element -- same as the Laguna
+            // target arch.
+            ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, noise_norm);
+            gate = ggml_softplus(ctx0, gate);
+            cb(gate, "attn_gate_softplus", il);
+
+            const int64_t n_tok = cur->ne[1];
+            if (layer.wqkv_gate->ne[1] == n_head) {
+                cur  = ggml_reshape_3d(ctx0, cur,  n_embd_head, n_head, n_tok);
+                gate = ggml_reshape_3d(ctx0, gate, 1,           n_head, n_tok);
+                cur  = ggml_mul(ctx0, cur, gate);
+                cur  = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_tok);
+            } else {
+                cur = ggml_mul(ctx0, cur, gate);
+            }
+            cb(cur, "attn_gated", il);
+
+            cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+        }
 
         if (attn_dynamic) {
             cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1);

@@ -125,6 +125,20 @@ struct llama_moe_residency_state {
     uint64_t advice_failure       = 0;
     uint64_t advice_einval        = 0;
     uint64_t invalid_mapping      = 0;
+
+    // Circuit breaker: when the first madvise() call returns ENOMEM, the
+    // kernel is telling us the system is under memory pressure and can't
+    // honor advisory hints. On UMA APUs (Flip 7840U, Strix) where the
+    // model file is mmap'd into the GPU-visible budget (VRAM+GTT shares
+    // DRAM), this is the steady-state for a model that fills most of
+    // the budget. Issuing further madvise() calls is pure syscall
+    // overhead with no benefit, so we set madvise_disabled_due_to_pressure
+    // and skip future calls. The LRU software policy still tracks
+    // touches/evictions for observability, but the kernel is left to
+    // manage the page cache on its own. Cleared on release() so a
+    // rebuilt state can re-attempt.
+    bool madvise_disabled_due_to_pressure = false;
+    uint64_t pressure_failure_count = 0;  // ENOMEM count before breaker tripped
 };
 
 // Build the residency state from a loaded MoE model. Returns true and
@@ -197,3 +211,24 @@ bool llama_moe_residency_topk_from_stats(
 int llama_moe_residency_debug_sample(
         const struct llama_moe_residency_state * st,
         int max_pages_per_tensor);
+
+// Platform-agnostic madvise wrapper. Returns 0 on success, -1 on failure
+// with errno set. `advice` accepts the MADV_WILLNEED / MADV_DONTNEED /
+// MADV_COLD symbols from <sys/mman.h> on Linux; on Windows the
+// implementation maps them onto PrefetchVirtualMemory / VirtualUnlock
+// as a non-destructive approximation.
+//
+// The enum values mirror the Linux <sys/mman.h> constants so the same
+// advice integer works on both platforms. Callers in production pass
+// the standard MADV_* symbols (provided by <sys/mman.h> on Linux and
+// by an internal shim on Windows) - the enum is for the test suite.
+enum llama_moe_residency_advice {
+    LLAMA_MOE_RESIDENCY_MADV_WILLNEED = 3,  // mirror Linux MADV_WILLNEED
+    LLAMA_MOE_RESIDENCY_MADV_DONTNEED = 4,  // mirror Linux MADV_DONTNEED
+    LLAMA_MOE_RESIDENCY_MADV_COLD     = 20, // mirror Linux MADV_COLD
+};
+LLAMA_API int llama_moe_residency_madvise(void * addr, size_t len, int advice);
+
+// Returns the OS page size in bytes. Wrapper around getpagesize() that
+// works on both POSIX and Windows. Exposed for the test suite.
+LLAMA_API int llama_moe_residency_pagesize(void);

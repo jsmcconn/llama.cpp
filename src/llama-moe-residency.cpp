@@ -16,7 +16,69 @@
 #include <cmath>
 #include <cstring>
 #include <cerrno>
-#if defined(__linux__)
+
+#if defined(_WIN32)
+// Windows has no madvise(); the calls below map onto the closest Win32
+// working-set hints. WILLNEED becomes PrefetchVirtualMemory (pages the
+// range in from the file), COLD/DONTNEED become VirtualUnlock, which
+// trims the range from the process working set without invalidating the
+// file-backed copy - a non-destructive approximation of MADV_COLD's
+// page-level reclaim hint. VirtualUnlock is a coarser, process-wide
+// mechanism and is a no-op (returns ERROR_NOT_LOCKED, which the shim
+// treats as success) on memory that was never VirtualLock'd.
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+// Mirror the Linux <sys/mman.h> values so the call sites in this file
+// use the same symbols on both platforms. Windows headers do not define
+// MADV_*, hence the explicit redeclaration here.
+#define MADV_WILLNEED 3
+#define MADV_DONTNEED 4
+#define MADV_COLD     20
+
+static int getpagesize(void) {
+    static int page_size = 0;
+    if (page_size == 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        page_size = (int) si.dwPageSize;
+    }
+    return page_size;
+}
+
+static int madvise(void * addr, size_t len, int advice) {
+    switch (advice) {
+        case MADV_WILLNEED:
+            {
+                WIN32_MEMORY_RANGE_ENTRY range;
+                range.VirtualAddress = addr;
+                range.NumberOfBytes  = len;
+                if (!PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
+                    errno = EINVAL;
+                    return -1;
+                }
+                return 0;
+            }
+        case MADV_COLD:
+        case MADV_DONTNEED:
+            // VirtualUnlock on a range that was never VirtualLock'd is
+            // effectively a no-op and reports ERROR_NOT_LOCKED, which we
+            // treat as success (matches the Linux "best-effort hint"
+            // contract for these advice values on file-backed mmaps).
+            if (!VirtualUnlock(addr, len) && GetLastError() != ERROR_NOT_LOCKED) {
+                errno = EINVAL;
+                return -1;
+            }
+            return 0;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+}
+#else
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -25,15 +87,13 @@
 // Helpers
 // ---------------------------------------------------------------------------
 
-#if defined(__linux__)
-static constexpr int MOE_MADV_COLD = MADV_COLD;
-static constexpr int MOE_MADV_WILLNEED = MADV_WILLNEED;
-static constexpr int MOE_MADV_DONTNEED = MADV_DONTNEED;
-#else
-static constexpr int MOE_MADV_COLD = 0;
-static constexpr int MOE_MADV_WILLNEED = 0;
-static constexpr int MOE_MADV_DONTNEED = 0;
-#endif
+static inline size_t page_align_down(size_t x) {
+    return x & ~(size_t(getpagesize()) - 1);
+}
+
+static inline size_t page_align_up(size_t x) {
+    return (x + size_t(getpagesize()) - 1) & ~(size_t(getpagesize()) - 1);
+}
 
 // Cache scoring helpers
 
@@ -79,16 +139,30 @@ static int find_evict_slot(const std::vector<llama_moe_layer_residency_internal:
 // separately because it is the most common failure mode for advice
 // values not applicable to the current mapping (e.g. MADV_FREE on a
 // MAP_SHARED file-backed mapping - invalid per the Linux man page).
+//
+// `st` (may be null) is the residency state, used to trip the
+// madvise circuit breaker on the first ENOMEM. Once tripped, subsequent
+// madvise calls are skipped to avoid wasting syscalls under sustained
+// memory pressure (the steady state on UMA APUs that mmap the model
+// into VRAM+GTT).
 static void safe_madvise(void * base, size_t len, int advice,
                          const char * advice_name,
                          uint64_t & c_success,
                          uint64_t & c_failure,
                          uint64_t & c_einval,
                          uint64_t & c_invalid_map,
-                         bool log_failures) {
-#if defined(__linux__)
+                         bool log_failures,
+                         llama_moe_residency_state * st) {
     if (!base || len == 0) {
         c_invalid_map++;
+        return;
+    }
+    // Circuit breaker: skip the syscall if a previous ENOMEM told us the
+    // system is under pressure. The LRU still tracks the touch for
+    // observability, but we don't burn cycles on madvise() that the
+    // kernel can't honor.
+    if (st && st->madvise_disabled_due_to_pressure) {
+        c_failure++;
         return;
     }
     uintptr_t p = reinterpret_cast<uintptr_t>(base);
@@ -108,6 +182,22 @@ static void safe_madvise(void * base, size_t len, int advice,
     int e = errno;
     c_failure++;
     if (e == EINVAL) c_einval++;
+    // ENOMEM trips the circuit breaker. The kernel is telling us it
+    // can't honor this advisory hint - either the system is under
+    // pressure, or the region is too large to track. Either way,
+    // further madvise() calls on the same state are pure overhead.
+    if (e == ENOMEM && st) {
+        st->pressure_failure_count++;
+        if (!st->madvise_disabled_due_to_pressure) {
+            st->madvise_disabled_due_to_pressure = true;
+            LLAMA_LOG_WARN(
+                "moe-residency: madvise(%s) returned ENOMEM; disabling further "
+                "madvise() calls to avoid syscall overhead under memory pressure. "
+                "The LRU policy continues to track expert usage for observability; "
+                "the kernel will manage the page cache on its own.\n",
+                advice_name ? advice_name : "?");
+        }
+    }
     if (log_failures) {
         LLAMA_LOG_WARN(
             "moe-residency: madvise(%s) failed: addr=%p len=%zu errno=%d (%s)\n",
@@ -115,17 +205,6 @@ static void safe_madvise(void * base, size_t len, int advice,
             reinterpret_cast<void *>(page_start),
             aligned_len, e, strerror(e));
     }
-#else
-    (void) base;
-    (void) len;
-    (void) advice;
-    (void) advice_name;
-    (void) c_success;
-    (void) c_failure;
-    (void) c_einval;
-    (void) c_invalid_map;
-    (void) log_failures;
-#endif
 }
 
 template <typename Fn>
@@ -271,10 +350,10 @@ void llama_moe_residency_touch(
             // valid for this mapping type.
             for_each_tensor(lr, [&](void * base, size_t stride) {
                 safe_madvise(reinterpret_cast<uint8_t *>(base) + eoff * stride,
-                             stride, MOE_MADV_COLD, "MADV_COLD",
+                             stride, MADV_COLD, "MADV_COLD",
                              st->advice_success, st->advice_failure,
                              st->advice_einval, st->invalid_mapping,
-                             st->cfg.log_advice_failures);
+                             st->cfg.log_advice_failures, st);
             });
             st->total_evicted++;
         }
@@ -296,10 +375,10 @@ void llama_moe_residency_touch(
     const size_t off = (size_t) expert_id;
     for_each_tensor(lr, [&](void * base, size_t stride) {
         safe_madvise(reinterpret_cast<uint8_t *>(base) + off * stride,
-                     stride, MOE_MADV_WILLNEED, "MADV_WILLNEED",
+                     stride, MADV_WILLNEED, "MADV_WILLNEED",
                      st->advice_success, st->advice_failure,
                      st->advice_einval, st->invalid_mapping,
-                     st->cfg.log_advice_failures);
+                     st->cfg.log_advice_failures, st);
     });
 }
 
@@ -365,14 +444,29 @@ void llama_moe_residency_prewarm(
             lr.slot_of[expert_id] = slot;
             st->total_touched++;
 
-            const size_t off = (size_t) expert_id;
-            for_each_tensor(lr, [&](void * base, size_t stride) {
-                safe_madvise(reinterpret_cast<uint8_t *>(base) + off * stride,
-                             stride, MOE_MADV_WILLNEED, "MADV_WILLNEED",
-                             st->advice_success, st->advice_failure,
-                             st->advice_einval, st->invalid_mapping,
-                             st->cfg.log_advice_failures);
-            });
+            // Intentionally do NOT issue MADV_WILLNEED here.
+            //
+            // Pre-faulting the top-K expert pages at startup means the
+            // kernel has to allocate page cache for K * 3 tensors * n_layer
+            // regions (e.g. 8 * 3 * 40 = 960 for a 40-layer MoE) all at
+            // once, on regions the user has not yet accessed. On UMA APUs
+            // (Flip 7840U, Strix) where the model file is mmap'd into the
+            // GPU-visible budget (VRAM+GTT shares DRAM), this overflows
+            // the kernel's free pages and the madvise calls fail with
+            // ENOMEM (errno 12). The model then either OOMs at load or
+            // runs with every expert page-cold and page-faults on every
+            // token - the exact regression residency is supposed to
+            // prevent.
+            //
+            // The right behavior is to install the LRU slots and let
+            // natural page faults on first inference page the experts
+            // in. The slot is marked occupied with loaded_at = now and
+            // access_count = 0, so the first touch() is a "hit" in the
+            // software policy (the policy thinks the expert is loaded)
+            // and the kernel serves the page from disk-backed mmap.
+            // On memory-rich systems (Halo, large VRAM) the kernel will
+            // keep these pages hot anyway because nothing else competes
+            // for the page cache.
         }
     }
 }
@@ -390,16 +484,20 @@ void llama_moe_residency_release(
             const size_t off = (size_t) e.expert_id;
             for_each_tensor(lr, [&](void * base, size_t stride) {
                 safe_madvise(reinterpret_cast<uint8_t *>(base) + off * stride,
-                             stride, MOE_MADV_DONTNEED, "MADV_DONTNEED",
+                             stride, MADV_DONTNEED, "MADV_DONTNEED",
                              st->advice_success, st->advice_failure,
                              st->advice_einval, st->invalid_mapping,
-                             st->cfg.log_advice_failures);
+                             st->cfg.log_advice_failures, st);
             });
             e.occupied = false;
         }
         for (auto & s : lr.slot_of) s = -1;
     }
     st->layers.clear();
+    // Reset the breaker so a rebuilt state can re-attempt. The OS memory
+    // state may have changed between releases.
+    st->madvise_disabled_due_to_pressure = false;
+    st->pressure_failure_count = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -420,11 +518,18 @@ void llama_moe_residency_log_stats(
     // Note: hit_rate is the SOFTWARE POLICY hit rate, not physical residency.
     // advice_einval counts madvise calls the kernel rejected (e.g. on
     // mapping types that don't support the advice). If einval > 0 here
-    // the policy is not actually doing anything.
-    LLAMA_LOG_INFO(
+    // the policy is not actually doing anything. madvise_pressure=true
+    // means the circuit breaker tripped - the LRU still tracks usage
+    // but the kernel manages the page cache on its own.
+    // Use LLAMA_LOG_WARN instead of LLAMA_LOG_INFO because ggml's
+    // GGML_LOG_LEVEL_INFO maps to LOG_LEVEL_TRACE (4) in the common
+    // log system, which is filtered out at the default verbosity (3).
+    // WARN maps to LOG_LEVEL_WARN (2) which passes the threshold.
+    LLAMA_LOG_WARN(
         "moe-residency: decodes=%llu touches=%llu policy_hits=%llu policy_misses=%llu "
         "evictions=%llu policy_hit_rate=%.1f%% "
-        "madvise: ok=%llu fail=%llu einval=%llu invalid_map=%llu ok_ratio=%.1f%%\n",
+        "madvise: ok=%llu fail=%llu einval=%llu invalid_map=%llu ok_ratio=%.1f%% "
+        "madvise_pressure=%s pressure_failures=%llu\n",
         (unsigned long long) st->decode_count,
         (unsigned long long) st->total_touched,
         (unsigned long long) st->total_hits,
@@ -435,7 +540,9 @@ void llama_moe_residency_log_stats(
         (unsigned long long) st->advice_failure,
         (unsigned long long) st->advice_einval,
         (unsigned long long) st->invalid_mapping,
-        advice_ok * 100.0);
+        advice_ok * 100.0,
+        st->madvise_disabled_due_to_pressure ? "true" : "false",
+        (unsigned long long) st->pressure_failure_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -599,3 +706,56 @@ int llama_moe_residency_debug_sample(
 }
 
 #endif
+
+// ---------------------------------------------------------------------------
+// Test-only public wrappers
+// ---------------------------------------------------------------------------
+// Expose the same call shape as the internal madvise/getpagesize helpers so
+// the test suite can exercise the platform shim without depending on the
+// internal counter plumbing. Production callers go through safe_madvise()
+// above, which adds page alignment, EINVAL tracking, and per-advice
+// counter updates.
+
+int llama_moe_residency_madvise(void * addr, size_t len, int advice) {
+#if defined(_WIN32)
+    switch (advice) {
+        case MADV_WILLNEED:
+            {
+                WIN32_MEMORY_RANGE_ENTRY range;
+                range.VirtualAddress = addr;
+                range.NumberOfBytes  = len;
+                if (!PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
+                    errno = EINVAL;
+                    return -1;
+                }
+                return 0;
+            }
+        case MADV_COLD:
+        case MADV_DONTNEED:
+            if (!VirtualUnlock(addr, len) && GetLastError() != ERROR_NOT_LOCKED) {
+                errno = EINVAL;
+                return -1;
+            }
+            return 0;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+#else
+    return ::madvise(addr, len, advice);
+#endif
+}
+
+int llama_moe_residency_pagesize(void) {
+#if defined(_WIN32)
+    static int page_size = 0;
+    if (page_size == 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        page_size = (int) si.dwPageSize;
+    }
+    return page_size;
+#else
+    return ::getpagesize();
+#endif
+}

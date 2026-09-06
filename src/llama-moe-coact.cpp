@@ -16,6 +16,12 @@
 #include <sstream>
 #include <system_error>
 
+#if defined(_WIN32)
+#define LLAMA_COACT_HOME_DIR "USERPROFILE"
+#else
+#define LLAMA_COACT_HOME_DIR "HOME"
+#endif
+
 namespace llama_moe_coact {
 
 void init(matrix & m, const struct llama_model & model) {
@@ -174,8 +180,15 @@ std::string persistence_path(const std::string & model_path) {
     auto dot = base.find_last_of('.');
     if (dot != std::string::npos) base = base.substr(0, dot);
 
-    const char * home = std::getenv("HOME");
-    if (!home || !*home) home = "/tmp";
+    const char * home = std::getenv(LLAMA_COACT_HOME_DIR);
+    if (!home || !*home) {
+#if defined(_WIN32)
+        home = std::getenv("TEMP");
+        if (!home || !*home) home = ".";
+#else
+        home = "/tmp";
+#endif
+    }
 
     std::string dir = std::string(home) + "/.cachylla/coactivation";
     std::error_code ec;

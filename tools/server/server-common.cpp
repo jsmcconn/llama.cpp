@@ -544,11 +544,12 @@ void server_tokens::push_back(server_tokens & tokens) {
         push_back(tokens[i]);
     }
     if (tokens.has_mtmd) {
-        // Assert if we are copying MTMD chunks to a server_tokens that does not have mtmd.
-        // We could also just check, but this will prevent silently dropping MTMD data.
-        GGML_ASSERT(has_mtmd);
-        for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ) {
-            auto * chunk = tokens.map_idx_to_media[it->first].get();
+        // Copying MTMD chunks in makes this container hold media. The old assert
+        // guarded against silently dropping the data; setting the flag keeps it,
+        // which is what the caller wanted, and matches push_back(chunk).
+        has_mtmd = true;
+        for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ++it) {
+            auto * chunk = it->second.get();
             mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
             map_idx_to_media[start_idx + it->first] = std::move(new_chunk);
         }

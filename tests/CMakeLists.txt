@@ -304,16 +304,17 @@ llama_build_and_test(test-kv-ssd-user-isolation.cpp)
 llama_build_and_test(test-ssd-cache-caps.cpp)
 llama_build_and_test(test-ssd-cache-continuation.cpp)
 llama_build_and_test(test-ssd-cache-prefix-match.cpp)
-# The residency tracker is intentionally an internal C++ component. Keep its
-# white-box unit test out of Windows shared-library builds, where the
-# implementation's internal llama symbols are not exported. Static builds
-# link the implementation and llama directly so the test remains useful on
-# Windows as well as Unix-like platforms.
+# Test-only wrappers in src/llama-moe-residency.h are declared LLAMA_API,
+# so this test links against libllama directly and runs on all platforms
+# including Windows+shared. Exercises the platform-agnostic madvise shim
+# (real madvise on Linux, PrefetchVirtualMemory/VirtualUnlock on Windows).
+llama_build_and_test(test-madvise-shim.cpp)
+target_include_directories(test-madvise-shim PRIVATE ${PROJECT_SOURCE_DIR}/src)
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # disabled on Windows because it uses internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-moe-residency-routing.cpp)
     target_include_directories(test-moe-residency-routing PRIVATE ${PROJECT_SOURCE_DIR}/src)
-    target_sources(test-moe-residency-routing PRIVATE
-      ${PROJECT_SOURCE_DIR}/src/llama-moe-residency.cpp)
+    target_sources(test-moe-residency-routing PRIVATE ${PROJECT_SOURCE_DIR}/src/llama-moe-residency.cpp)
     target_link_libraries(test-moe-residency-routing PRIVATE llama)
 endif()
 # the test serves its repos from an httplib server, and the library links it privately

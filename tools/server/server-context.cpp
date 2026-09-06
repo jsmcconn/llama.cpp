@@ -890,6 +890,14 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // server_context_impl (private implementation)
 //
 
+// Persistent caches store text token IDs; actual media chunks require re-encoding.
+// A multimodal-capable server also marks text-only token containers has_mtmd,
+// so test their content rather than the model capability.
+static const llama_tokens & cache_tokens_or_empty(const server_tokens & t) {
+    static const llama_tokens none;
+    return t.has_media() ? none : t.get_tokens();
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -3239,12 +3247,14 @@ private:
         if (ssd_page_manager &&
             !(slot.task ? slot.task->tokens.has_media() : slot.prompt.tokens.has_media())) {
             const auto & prefix_tokens = slot.task
-                ? slot.task->tokens.get_tokens()
-                : slot.prompt.tokens.get_tokens();
-            ssd_page_manager->store_checkpoint_with_tokens(
-                slot.id, ctx_tgt, ctx_dft.get(), cur, prefix_tokens.data(),
-                prefix_tokens.size(), ssd_turn_counter, slot.conv_hash,
-                slot.task ? slot.task->user_id : std::string());
+                ? cache_tokens_or_empty(slot.task->tokens)
+                : cache_tokens_or_empty(slot.prompt.tokens);
+            if (!prefix_tokens.empty()) {
+                ssd_page_manager->store_checkpoint_with_tokens(
+                    slot.id, ctx_tgt, ctx_dft.get(), cur, prefix_tokens.data(),
+                    prefix_tokens.size(), ssd_turn_counter, slot.conv_hash,
+                    slot.task ? slot.task->user_id : std::string());
+            }
         }
     }
 
@@ -3263,8 +3273,21 @@ private:
             return;
         }
 
-        const auto & tokens = slot.task->tokens.get_tokens();
+        const auto & tokens = cache_tokens_or_empty(slot.task->tokens);
         if (tokens.empty()) {
+            return;
+        }
+
+        // A recurrent memory has no attention KV to pair the recurrent state with,
+        // so a PARTIAL_ONLY blob for it is exactly the recurrent state alone.
+        // The restore sites skip the load for the same reason
+        // (llama_memory_hybrid::seq_pos_max is min(attn_max, recr_max) and attn_max
+        // is -1 there, so nothing can advance n_past over a [0, n_sys) prefix). Skip
+        // the write here too so the on-disk index does not accumulate 157 MB entries
+        // per cold start that no consumer can use. Making the cache work for these
+        // models needs the attention half in the blob, which is a format change.
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+            slot_sys_hash[slot.id] = 1;  // mark as checked, nothing to do
             return;
         }
 
@@ -4331,28 +4354,53 @@ private:
                                     (const uint32_t*)task_tokens.data(), (size_t)n_sys);
 
                                 std::vector<uint8_t> sys_data;
-                                if (sys_cache->load((const uint32_t*)task_tokens.data(),
+                                // A PARTIAL_ONLY blob is recurrent-state-only on a hybrid
+                                // memory: llama_memory_hybrid::state_write() writes mem_attn
+                                // only when the flag is clear, and the store side
+                                // (maybe_extract_system_prompt) sets it. Restoring it therefore
+                                // cannot produce a usable prefix - the attention cells stay
+                                // empty, so llama_memory_seq_pos_max(), which is
+                                // min(attn_max, recr_max), reports -1 and nothing may advance
+                                // n_past over it. Attempting the load anyway would only
+                                // overwrite the recurrent state the sequence already holds, so
+                                // skip it before touching the memory.
+                                //
+                                // Making the cache work for these models needs the attention
+                                // half in the blob, i.e. a stored-format change. Out of scope.
+                                const bool sys_restorable =
+                                    ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+                                if (!sys_restorable) {
+                                    SLT_DBG(slot, "system prompt cache: skipping restore, a "
+                                            "recurrent-only state cannot supply [0,%d)\n", n_sys);
+                                } else if (sys_cache->load((const uint32_t*)task_tokens.data(),
                                                     (uint32_t)n_sys, sys_data)) {
-                                    // Restore system prompt state from cache
-                                    // Match the save flag (PARTIAL_ONLY) used by
-                                    // maybe_extract_system_prompt(). The system prompt
-                                    // cache only stores recurrent memory state, not
-                                    // attention KV cache. Loading with NONE would try
-                                    // to read attention data that isn't there.
                                     if (llama_state_seq_set_data_ext(ctx_tgt, sys_data.data(),
                                             sys_data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 0) {
-                                        n_past = n_sys;
+                                        // set_data_ext reports bytes consumed, not that a usable
+                                        // prefix now exists. Verify against the memory before
+                                        // advancing n_past; on failure leave the slot untouched
+                                        // and let the normal cold-start path handle it.
+                                        auto * mem_sys = llama_get_memory(ctx_tgt);
+                                        const auto sys_pos_min = llama_memory_seq_pos_min(mem_sys, slot.id);
+                                        const auto sys_pos_max = llama_memory_seq_pos_max(mem_sys, slot.id);
+                                        if (sys_pos_min == 0 && sys_pos_max >= n_sys - 1) {
+                                            n_past = n_sys;
 
-                                        // Populate slot.prompt.tokens so get_common_prefix()
-                                        // finds the match and preserves n_past. Without this,
-                                        // get_common_prefix() returns 0 on empty tokens and
-                                        // the restored state is wiped by seq_rm(ctx, 0, -1).
-                                        for (int32_t i = 0; i < n_sys; i++) {
-                                            slot.prompt.tokens.push_back(task_tokens[i]);
+                                            // Populate slot.prompt.tokens so get_common_prefix()
+                                            // finds the match and preserves n_past. Without this,
+                                            // get_common_prefix() returns 0 on empty tokens and
+                                            // the restored state is wiped by seq_rm(ctx, 0, -1).
+                                            for (int32_t i = 0; i < n_sys; i++) {
+                                                slot.prompt.tokens.push_back(task_tokens[i]);
+                                            }
+
+                                            SLT_INF(slot, "system prompt cache hit: hash=%016lx, n_sys=%d\n",
+                                                    sys_hash, n_sys);
+                                        } else {
+                                            SLT_WRN(slot, "system prompt cache entry restored no usable [0,%d) "
+                                                    "prefix (pos_min=%d pos_max=%d) - cold start instead\n",
+                                                    n_sys, (int) sys_pos_min, (int) sys_pos_max);
                                         }
-
-                                        SLT_INF(slot, "system prompt cache hit: hash=%016lx, n_sys=%d\n",
-                                                sys_hash, n_sys);
                                     }
                                 }
                             }
@@ -4641,7 +4689,16 @@ private:
                                 std::vector<uint8_t> sys_data;
                                 bool recovered = false;
 
-                                if (n_sys >= MIN_USEFUL_SYS_TOKENS && n_sys < (int32_t)task_tokens.size()) {
+                                // As at the cold-start site above: on a hybrid memory the stored
+                                // blob is recurrent-state-only, so nothing restored from it can
+                                // carry [0, n_sys). Here the slot is still holding the previous
+                                // turn's state, so attempting the load would overwrite it for
+                                // nothing - skip before touching the memory.
+                                const bool sys_restorable =
+                                    ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+
+                                if (sys_restorable && n_sys >= MIN_USEFUL_SYS_TOKENS &&
+                                        n_sys < (int32_t)task_tokens.size()) {
                                     if (sys_cache->load((const uint32_t*)task_tokens.data(),
                                                         (uint32_t)n_sys, sys_data)) {
                                         recovered_n_sys = n_sys;
@@ -4649,14 +4706,11 @@ private:
                                     } else if ((uint32_t)n_sys >= MIN_PREFIX_MATCH &&
                                                sys_cache->load_prefix((const uint32_t*)task_tokens.data(),
                                                        (uint32_t)n_sys, MIN_PREFIX_MATCH, sys_data)) {
-                                        // Prefix fallback matched. Use the boundary as
-                                        // n_past - the loaded state's recurrent state covers
-                                        // up to the stored entry's n_tokens, but for hybrid
-                                        // models the state at position N is computed from
-                                        // tokens [0, N). If the first 64+ tokens match we
-                                        // accept the approximate match; any model state drift
-                                        // is bounded by the small divergent region at the
-                                        // boundary.
+                                        // Prefix fallback matched: the entry agrees on its first
+                                        // MIN_PREFIX_MATCH tokens, and the divergent tail is
+                                        // accepted as approximate. Only reached for non-recurrent
+                                        // memories now - a recurrent state is one tensor folded
+                                        // over every token, so "approximate" does not apply to it.
                                         recovered_n_sys = n_sys;
                                         recovered = true;
                                         SLT_DBG(slot, "[PROBE] sys-cache-fallback prefix-match recovered at n_sys=%d (exact match failed)\n",
@@ -4667,22 +4721,35 @@ private:
                                 if (recovered) {
                                     if (llama_state_seq_set_data_ext(ctx_tgt, sys_data.data(),
                                             sys_data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 0) {
-                                        n_past = recovered_n_sys;
-                                        pos_next = recovered_n_sys;
-                                        // Replace stale tokens from the previous turn with
-                                        // the new task's first n_sys tokens. Stale tokens
-                                        // would corrupt the prefill loop after n_past jumps.
-                                        slot.prompt.tokens.keep_first(0);
-                                        for (int32_t i = 0; i < recovered_n_sys; i++) {
-                                            slot.prompt.tokens.push_back(task_tokens[i]);
+                                        // Same verification as the cold-start site above. The
+                                        // comment that used to sit here argued the attention side
+                                        // "will be filled as prefill processes the remaining
+                                        // tokens" - it will not: prefill starts at n_past, so
+                                        // [0, n_sys) would stay empty for the whole request.
+                                        auto * mem_sys = llama_get_memory(ctx_tgt);
+                                        const auto sys_pos_min = llama_memory_seq_pos_min(mem_sys, slot.id);
+                                        const auto sys_pos_max = llama_memory_seq_pos_max(mem_sys, slot.id);
+                                        if (sys_pos_min == 0 && sys_pos_max >= recovered_n_sys - 1) {
+                                            n_past   = recovered_n_sys;
+                                            pos_next = recovered_n_sys;
+                                            // Replace stale tokens from the previous turn with
+                                            // the new task's first n_sys tokens. Stale tokens
+                                            // would corrupt the prefill loop after n_past jumps.
+                                            slot.prompt.tokens.keep_first(0);
+                                            for (int32_t i = 0; i < recovered_n_sys; i++) {
+                                                slot.prompt.tokens.push_back(task_tokens[i]);
+                                            }
+                                            slot.ssd_cold_start_used = true;
+                                            SLT_DBG(slot, "[PROBE] sys-cache-fallback n_past=%d (n_sys=%d) after do_reset\n",
+                                                    n_past, recovered_n_sys);
+                                        } else {
+                                            // Leave n_past at 0 and the slot as it is; the normal
+                                            // truncation and checkpoint-recovery path below owns
+                                            // the cleanup.
+                                            SLT_WRN(slot, "sys-cache fallback restored no usable [0,%d) prefix "
+                                                    "(pos_min=%d pos_max=%d) - cold start instead\n",
+                                                    recovered_n_sys, (int) sys_pos_min, (int) sys_pos_max);
                                         }
-                                        // Route seq_rm through seq_rm_attn_only so the loaded
-                                        // recurrent state is preserved (attention is empty for
-                                        // the system section and will be filled as prefill
-                                        // processes the remaining tokens).
-                                        slot.ssd_cold_start_used = true;
-                                        SLT_DBG(slot, "[PROBE] sys-cache-fallback n_past=%d (n_sys=%d) after do_reset\n",
-                                                n_past, recovered_n_sys);
                                     }
                                 }
                             }
