@@ -2917,10 +2917,8 @@ private:
         // dead entries.  Insertion order gives true round-robin cycling (1..N,
         // 1..N, ...) and works for both mid-prompt and deferred-final entries.
         //
-        // For hybrid/recurrent models, the LCP acceptance predicate (line ~4264)
-        // still filters by pos_min / pos_max and applies its own n_swa > 0 check;
-        // reverse iteration (rbegin/rend) picks the newest qualifying entry, so
-        // insertion-order insertion doesn't affect which checkpoint is selected.
+        // Reverse iteration picks the newest checkpoint at a reusable boundary.
+        // Recurrent snapshots must match the complete saved prefix.
         // Direct slot restore runs while the slot is idle, so there is no
         // active task to associate with the synthesized checkpoint.
         const int id_task = slot.task ? slot.task->id : -1;
@@ -2976,9 +2974,7 @@ private:
 
         cur.id_task = id_task;
 
-        // Note: for SWA models, pos_min/pos_max may not cover the full [0, pos_max]
-        // range (see LCP acceptance predicate at line ~4264 which applies an
-        // n_swa > 0 guard excluding checkpoints where cur.pos_max > pos_next).
+        // Position metadata describes the state before the pending batch.
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3027,46 +3023,33 @@ private:
         }
     }
 
-    // Deferred final checkpoint: captures full prompt state after the last
-    // batch was processed and the first generation token has been sent.
-    // Runs asynchronously relative to the client, so the ~670 MiB SSD write
-    // does not block the first token.
+    // Capture the prompt boundary after sending its first sampled token.
+    // Checkpoint copying and SSD writes still run synchronously on the server loop.
     void deferred_create_final_checkpoint(server_slot & slot) {
         if (params_base.n_ctx_checkpoints <= 0) return;
         if (!slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION) return;
 
-        // Use prompt positions, not generation positions.
-        // The generation positions (done_pos_min/done_pos_max) extend past
-        // the prompt end and cause stale positions to persist after restore,
-        // triggering "Invalid input batch" on the next turn (issue #8).
-        // CRITICAL: Use slot.prompt.n_tokens() - slot.stats.n_gen + 1 (actual
-        // prompt tokens processed) NOT slot.task->n_tokens() (which is the
-        // full task token count, including unprocessed conversation history)
-        // and NOT slot.prompt.n_tokens() alone (which includes generated
-        // tokens added since the deferred flag was set). At this point the
-        // first generation token has been sampled (n_decoded incremented)
-        // but NOT yet pushed to prompt.tokens (handle_last_sampled_token
-        // runs after the sampling loop, not inside it). So:
-        //   prompt.tokens has N + (k-1) tokens for the k-th generation
-        //   n_decoded = k
-        //   prompt_n_tokens = (N + k - 1) - k + 1 = N  (the prompt boundary)
-        // Subtracting only n_decoded (without the +1) gave N - 1, which
-        // made pos_max cover positions [0, N-2] instead of [0, N-1] -- the
-        // last prompt token's KV cache entry was stripped from the checkpoint.
-        // On restore the model had to reprocess that 1 token every cold
-        // start, and f_keep/f_sim metrics were off by 1 token.
+        // The sampled token has not been appended to prompt.tokens yet.
         const int64_t prompt_n_tokens = slot.prompt.n_tokens() - slot.stats.n_gen + 1;
         if (prompt_n_tokens < 64) return;
-
-        // Note: cold-start mid-prompts (create_checkpoint() emits one with
-        // pos_min==0 on a fresh slot, since pos_min_thold==0 with no prior
-        // context) intentionally share the (pos_min=0, pos_max=prompt_end)
-        // signature of a deferred final.  They're valid LCP snapshots at
-        // [0, batch_end] and consumed by the LCP acceptance predicate on
-        // future turns.  The SWA-skip guard in get_available() preserves
-        // them alongside real deferred finals, costing one of the N ring
-        // buffer slots per cold start.  That's correct -- not a bug.
-        //
+        const bool recurrent = server_context_has_recurrent_state(ctx_tgt);
+        if (recurrent) {
+            if (slot.prompt.tokens.has_media()) return;
+            const auto pos = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+            const auto draft_pos = ctx_dft
+                ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft.get()), slot.id) : pos;
+            // A delayed speculative callback cannot rewind a recurrent tensor by
+            // trimming attention or changing position metadata. Keep existing
+            // checkpoints and skip a final snapshot unless this is the real,
+            // fully evaluated prompt boundary before generation has advanced it.
+            if (slot.stats.n_gen != 1 || prompt_n_tokens != slot.task->n_tokens() ||
+                    pos != prompt_n_tokens - 1 || draft_pos != pos) {
+                SLT_WRN(slot, "skipping incomplete recurrent final checkpoint "
+                        "(prompt=%" PRId64 ", task=%d, generated=%d, pos=%d, draft_pos=%d)\n",
+                        prompt_n_tokens, slot.task->n_tokens(), (int) slot.stats.n_gen, pos, draft_pos);
+                return;
+            }
+        }
 
         // Deferred checkpoint always captures final state. Skip the proximity
         // guard used for mid-prompt checkpoints — the deferred ckpt is never
@@ -3140,62 +3123,74 @@ private:
         // Save prompt boundaries: pos_min=0 (start of prompt), pos_max=prompt_n_tokens-1 (end of prompt)
         cur.update_pos(prompt_n_tokens, 0, (llama_pos)prompt_n_tokens - 1);
 
-        // The checkpoint metadata says n_tokens=prompt_n_tokens (prompt only),
-       // but update_tgt/update_dft save the FULL KV cache including generated
-       // token entries.  A metadata/data mismatch causes hallucination on
-       // restore: the model loads generated-token KV cache and attends to its
-       // own previous output.  Fix: temporarily strip generated-token entries
-       // from the live KV cache, save the prompt-only state, then restore the
-       // full KV cache so continued generation is unaffected.
-        {
-            // --- ctx_tgt (main model KV cache) ---
-            size_t full_size = llama_state_seq_get_size_ext(
-                ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            std::vector<uint8_t> full_state;
-            if (full_size > 0) {
-                full_state.resize(full_size);
-                llama_state_seq_get_data_ext(ctx_tgt, full_state.data(),
-                    full_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            }
-
-            auto * mem_tgt = llama_get_memory(ctx_tgt);
-            if (mem_tgt) {
-                llama_memory_seq_rm_attn_only(
-                    mem_tgt, slot.id, (llama_pos)prompt_n_tokens, -1);
-            }
-
+        if (recurrent) {
+            // Exact live boundary: save once without modifying or round-tripping
+            // target state. The MTP draft and its pending state are saved together.
             cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-            if (!full_state.empty()) {
-                llama_state_seq_set_data_ext(ctx_tgt, full_state.data(),
-                    full_state.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            }
-        }
-
-        // --- ctx_dft (draft/MTP model KV cache) ---
-        if (ctx_dft) {
-            size_t full_size = llama_state_seq_get_size_ext(
-                ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            std::vector<uint8_t> full_state;
-            if (full_size > 0) {
-                full_state.resize(full_size);
-                llama_state_seq_get_data_ext(ctx_dft.get(), full_state.data(),
-                    full_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            }
-
-            auto * mem_dft = llama_get_memory(ctx_dft.get());
-            if (mem_dft) {
-                llama_memory_seq_rm_attn_only(
-                    mem_dft, slot.id, (llama_pos)prompt_n_tokens, -1);
-            }
-
             cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        } else {
+            // The checkpoint metadata says n_tokens=prompt_n_tokens (prompt only),
+           // but update_tgt/update_dft save the FULL KV cache including generated
+           // token entries.  A metadata/data mismatch causes hallucination on
+           // restore: the model loads generated-token KV cache and attends to its
+           // own previous output.  Fix: temporarily strip generated-token entries
+           // from the live KV cache, save the prompt-only state, then restore the
+           // full KV cache so continued generation is unaffected.
+            {
+                // --- ctx_tgt (main model KV cache) ---
+                size_t full_size = llama_state_seq_get_size_ext(
+                    ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                std::vector<uint8_t> full_state;
+                if (full_size > 0) {
+                    full_state.resize(full_size);
+                    llama_state_seq_get_data_ext(ctx_tgt, full_state.data(),
+                        full_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
 
-            if (!full_state.empty()) {
-                llama_state_seq_set_data_ext(ctx_dft.get(), full_state.data(),
-                    full_state.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                auto * mem_tgt = llama_get_memory(ctx_tgt);
+                if (mem_tgt) {
+                    llama_memory_seq_rm_attn_only(
+                        mem_tgt, slot.id, (llama_pos)prompt_n_tokens, -1);
+                }
+
+                cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                if (!full_state.empty()) {
+                    llama_state_seq_set_data_ext(ctx_tgt, full_state.data(),
+                        full_state.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
             }
+
+            // --- ctx_dft (draft/MTP model KV cache) ---
+            if (ctx_dft) {
+                size_t full_size = llama_state_seq_get_size_ext(
+                    ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                std::vector<uint8_t> full_state;
+                if (full_size > 0) {
+                    full_state.resize(full_size);
+                    llama_state_seq_get_data_ext(ctx_dft.get(), full_state.data(),
+                        full_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
+
+                auto * mem_dft = llama_get_memory(ctx_dft.get());
+                if (mem_dft) {
+                    llama_memory_seq_rm_attn_only(
+                        mem_dft, slot.id, (llama_pos)prompt_n_tokens, -1);
+                }
+
+                cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                if (!full_state.empty()) {
+                    llama_state_seq_set_data_ext(ctx_dft.get(), full_state.data(),
+                        full_state.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
+            }
+
         }
+
+        // MTP's pending carry embedding belongs to the same boundary as its KV.
+        // Save it for warm restores and for the full-state SSD serializer.
+        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         // Log the resulting entry.  The canonical "what just happened" message
         // is the "recycled" or "pushed" final line above; this line confirms

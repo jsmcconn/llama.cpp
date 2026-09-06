@@ -1,83 +1,83 @@
-# Context checkpoint system
+# Context checkpoints for Qwen Flash Next
 
-The server maintains a per-slot ring buffer of in-memory KV cache snapshots ("context checkpoints") used to skip prompt reprocessing on cached turns (LCP / f_keep optimization). Four interlocking pieces — change one, re-verify the others.
+This fork combines upstream Qwen Flash Next support, the Qwen4Exp shared MTP
+implementation, and CachyLlama's
+persistent conversation cache. The workstation uses one slot. Slot ownership
+provides cache affinity; an idle slot can always be reassigned to a new identity.
+Compaction often changes the automatic identity because it changes the first
+user message. Reassignment clears live state and searches the new owner's RAM
+and SSD caches. Both cache tiers scope entries by identity.
 
-## 1. Two producer paths feeding one `std::list<common_prompt_checkpoint>`
+## Recurrent state has an exact boundary
 
-- **`create_checkpoint()`** — mid-prompt snapshots fired during prefill when a batch starts a user message (or `--checkpoint-near-end` is set and we're near the prompt end). Uses the live KV cache's `pos_min` / `pos_max` from `llama_memory_seq_pos_*`, skipping if checkpoints are too close (`checkpoint_min_step`, default 8192).
-- **`deferred_create_final_checkpoint()`** — after the first generation token lands, captures a full prompt snapshot at `pos_min = 0`, `pos_max = prompt_n_tokens - 1`. Runs asynchronously so the SSD write doesn't block decode.
+A Qwen hybrid checkpoint contains recurrent tensors representing the entire
+saved prefix. It cannot be trimmed or rewound by removing attention entries.
+`pos_max` is inclusive, so a text checkpoint with N tokens ends at N-1 and resumes
+at N. A warm restore requires all N tokens to match the incoming prompt and at
+least one genuine suffix token to decode for logits. Exact-length retries use
+an earlier matching checkpoint or reprocess the prompt. A middle edit cannot
+reuse a later recurrent snapshot, even if its metadata has `pos_min=0`.
 
-Both add with `emplace_back`, so list position equals insertion order.
+`common_prompt_checkpoint::can_resume_recurrent` checks these boundaries.
+Checkpoint invalidation removes snapshots beyond the retained prefix, including
+deferred finals. Cache safety checks the model architecture, so turning off
+bounded recurrent rollback does not accidentally enable partial SSD restores.
 
-## 2. Insertion-order ring buffer eviction
+## Capture and persistence
 
-When the list reaches `n_ctx_checkpoints` (default 32), the ring buffer pops the FRONT (oldest) and appends the new entry at the back.
+`create_checkpoint()` records mid-prompt state before decoding the pending
+batch. The token count excludes that batch; position metadata comes from the
+live memory. These partial snapshots support warm rollback while attention
+entries are still resident.
 
-Why insertion-order, not "highest pos_min": deferred finals all carry `pos_min == 0`, so the old strict-greater-than comparator always picked `begin()` and recycled the oldest entry every time — a single-slot FIFO with N-1 dead entries. Insertion order breaks the tie and gives a true round-robin across conversation snapshots. The acceptance predicate filters by `pos_min` / `pos_max` regardless of list position, so cycling doesn't affect matching.
+`deferred_create_final_checkpoint()` normally runs immediately after the first
+sampled token is sent, before it is added to the prompt. For recurrent targets
+it verifies the live state is at the complete prompt boundary and that only one
+token has been sampled. A delayed callback is skipped rather than manufacturing
+an earlier recurrent state from position metadata. Exact recurrent snapshots
+are copied once without temporarily changing the live target memory.
 
-Cold-start mid-prompts (created on a fresh slot where `pos_min_thold == 0` makes the first batch's `pos_min` equal 0 too) share the same `pos_min == 0` signature as deferred finals. They're valid LCP snapshots either way — they just consume one of the N ring buffer slots.
+Checkpoint copying and disk writes run synchronously on the inference loop.
+Sending the first token before the final checkpoint can improve first-token
+latency; it does not make the checkpoint write asynchronous or free.
 
-## 3. SWA-skipped entries persist across turns
+Durable SSD checkpoints contain full target and draft state plus speculative
+implementation state. This differs from the partial in-memory snapshots. SSD
+restore requires a fully matching prefix at an exact saved boundary and a real
+suffix to decode. Synthetic RAM metadata after SSD restore also uses inclusive
+`pos_max=N-1`. The target-only system-prompt cache is disabled for recurrent
+models because it cannot restore the required attention/recurrent/MTP state.
 
-In `get_available()` there's an SWA invalidation block that erases checkpoints whose `pos_max > pos_next` for non-deferred-final snapshots. Deferred-final snapshots (`pos_min == 0`) are preserved across turns. Without this guard, the SWA step would erase every prior deferred final and the ring buffer would never accumulate past 2 entries.
+## Capacity and write cadence
 
-Genuine SWA invalidation still happens inside the LCP acceptance predicate:
+Count eviction follows insertion order. Both producers also prune older entries
+against `_ckpt_memory_budget()`. Its budget is `max(2 GiB, checkpoint_count *
+400 MiB)`; 32 entries give 12.5 GiB. This is a pruning threshold for prior entries,
+not an OS memory reservation or a strict allocation ceiling: at least one entry
+is retained and the next snapshot is allocated after pruning. For Qwen Flash
+Next, partial recurrent snapshots are much smaller than full SSD snapshots.
 
-```cpp
-if (n_swa > 0 && cur.pos_max > pos_next) return false;
-```
+The separate RAM prompt cache, SSD hot/warm tiers, model weights, PLE table and
+in-flight state copies also consume memory. Assess actual resident usage and
+available RAM rather than summing configured capacities as committed memory.
 
-That predicate is the right place to filter by SWA coverage; the `get_available()` guard exists only to keep the buffer populated, not to make SWA-correctness decisions.
+The workstation SSD cadence persists when token growth or maximum age is due.
+`KV_SSD_STORE_SKIP_CADENCE` defers a write; it does not defer inference. Large
+checkpoints that exceed the hot-tier cap remain cold and stream directly into
+restore buffers. The filesystem size cap includes loaded and unloaded sessions.
 
-**Don't add a redundant erase here based on SWA coverage** — that path will self-conflict.
+## Validation
 
-## 4. Memory budget (`_ckpt_memory_budget()`)
+- `test-recurrent-checkpoint-boundary`: appended prefixes, edits, retries,
+  inclusive metadata, empty checkpoints.
+- `test-server-cache-identity`: owner-scoped deduplication, replacement and
+  lookup, plus text containers on a media-capable server.
+- Existing SSD isolation, prefix, continuation and capacity tests.
+- `tools/server/tests/qwen_cache_live.py`: manual model-dependent API checks on
+  an isolated server, including automatic identity changes during compaction,
+  usage totals, cancellation, tools, vision, warm/cold parity and SSD restart.
 
-The two producer paths handle size- and count-based eviction in **different orders**:
-
-- **`deferred_create_final_checkpoint()`** runs size-based eviction *before* count-based eviction. Once a checkpoint exceeds the per-call budget it is dropped, so the count cap never sees it.
-- **`create_checkpoint()`** runs count-based eviction (insertion-order pop_front) *before* size-based eviction. The count cap is enforced first; only entries that survive count eviction are candidates for size eviction. It also runs an additional pre-pass that erases checkpoints whose `n_tokens` falls within `checkpoint_min_step` of a prior checkpoint on a different task — those are noise, not state.
-
-The size budget function is the same in both paths:
-
-```cpp
-size_t _ckpt_memory_budget() const {
-    const size_t default_limit = (size_t)2 * 1024 * 1024 * 1024;  // 2 GiB floor
-    if (params_base.n_ctx_checkpoints <= 0) return default_limit;
-    // 400 MiB per configured checkpoint = 200 MiB working set * 2 headroom.
-    const size_t per = (size_t)params_base.n_ctx_checkpoints * 400 * 1024 * 1024;
-    return std::max(default_limit, per);
-}
-```
-
-The budget **floors** (not caps) at 2 GiB and scales upward with `n_ctx_checkpoints` so the auto-scaled count from `llama-ai/scripts/optimize.sh` (8 base + 1 per 8K above 65K context, capped at 32) actually fires. An earlier version coupled it to `cache_ram` (1%) and unconditionally capped checkpoints at 3-4 — the auto-scaling was a no-op.
-
-Worst case at 32 checkpoints: 32 × 400 MiB = 12.8 GiB (the `std::max` floors at 2 GiB so small checkpoint counts still get a 2 GiB working set as a minimum). For the default 32 checkpoints at typical q8_0 KV (~50 MiB each ~= 1.6 GiB total), the budget is the 12.8 GiB cap, well above the working set.
-
-## 5. LCP acceptance predicate
-
-The walk in `get_available()` / `decode-input` is reverse-iteration (newest first). The first qualifying entry wins. Both deferred finals (`pos_min = 0`) and early-mid-prompts (`pos_min < pos_min_thold`) are accepted; mid-prompts whose `pos_min` falls past `pos_min_thold` but haven't been SWA-shifted are also accepted.
-
-## Auto-scaling (from `llama-ai/scripts/optimize.sh`)
-
-```bash
-base_ctx = 65536
-base_cp  = 8
-scale_per = 8192
-max_cp   = 32
-if [[ $ctx -gt $base_ctx ]]; then
-    extra = (ctx - base_ctx) / scale_per
-    SOLVER_CHECKPOINTS = base_cp + extra
-fi
-[[ $SOLVER_CHECKPOINTS -gt $max_cp ]] && SOLVER_CHECKPOINTS = max_cp
-```
-
-| Context | Checkpoints |
-| ------- | ----------- |
-| <= 65 K | 8           |
-| 98 K    | 12          |
-| 131 K   | 16          |
-| 196 K   | 24          |
-| 262 K   | 32 (capped) |
-
-Verified on Nimo (Strix Halo) with Laguna-S-2.1 Q5_K_XL at 131K context: ring buffer saturates at 16, then cycles oldest-first across turns 1..16, 1..16, ... — true round-robin. f_keep climbs monotonically (0.488 -> 0.949 across 20 turns), 18 ckpt-restored events after the first cold turn.
+The API's OpenAI `prompt_tokens` counts the full request, including cached input.
+`prompt_tokens_details.cached_tokens` is a subset. Anthropic separates uncached
+`input_tokens` from `cache_read_input_tokens`; add them for full input size.
+A client's cumulative uncached-token analytics are not a context-size measure.
