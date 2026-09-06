@@ -1219,6 +1219,10 @@ struct common_prompt_checkpoint {
     bool empty() const;
     void clear();
 
+    // Text-only recurrent state must match the whole retained prefix and
+    // leave real suffix tokens to decode (checkpoints do not store logits).
+    bool can_resume_recurrent(int64_t matched_tokens, int64_t prompt_tokens) const;
+
     void update_pos(
             int64_t n_tokens,
             llama_pos pos_min,

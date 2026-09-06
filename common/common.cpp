@@ -2288,6 +2288,11 @@ void common_prompt_checkpoint::clear() {
     data_spec.clear();
 }
 
+bool common_prompt_checkpoint::can_resume_recurrent(int64_t matched_tokens, int64_t prompt_tokens) const {
+    return n_tokens > 0 && n_tokens <= matched_tokens && n_tokens < prompt_tokens &&
+        pos_max >= 0 && (int64_t) pos_max + 1 == n_tokens;
+}
+
 void common_prompt_checkpoint::update_pos(
         int64_t n_tokens,
         llama_pos pos_min,

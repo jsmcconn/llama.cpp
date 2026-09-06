@@ -621,6 +621,7 @@ struct server_prompt_data {
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+    std::string user_id;
 
     // timestamp of last access (used for smarter cache eviction)
     int64_t t_last_used = 0;
@@ -654,9 +655,9 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, const std::string & user_id = {});
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & user_id = {});
 
     // update cache, evicting entries that exceed memory limits
     // tokens_ref: the incoming task tokens, used to compute overlap for smarter eviction
