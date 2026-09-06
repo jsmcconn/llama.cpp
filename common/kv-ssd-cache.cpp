@@ -375,6 +375,9 @@ static bool write_index_file(kv_ssd_cache* c) {
     hdr.model_identity      = c->config.model_identity;
     hdr.model_hash          = c->config.model_hash;
     hdr.payload_size        = 0;  // index is fixed-size for now
+    for (size_t i = 0; i < c->prefix_checkpoint_ids.size() && i < 3; ++i) {
+        hdr.prefix_checkpoint_ids[i] = c->prefix_checkpoint_ids[i];
+    }
     // FNV-1a over the header bytes with the checksum field zeroed. The
     // checksum is at a fixed offset; the prior zeroed state means
     // recomputing after the actual write gives a stable value.
@@ -416,6 +419,17 @@ static bool read_index_file(kv_ssd_cache* c) {
     if (!validate_checksum(hdr, "index")) return false;
 
     c->next_id = hdr.next_id;
+    c->prefix_checkpoint_ids.clear();
+    for (uint64_t id : hdr.prefix_checkpoint_ids) {
+        if (id != 0 && c->config.prefix_checkpoints > 0 &&
+                std::find(c->prefix_checkpoint_ids.begin(), c->prefix_checkpoint_ids.end(), id) ==
+                c->prefix_checkpoint_ids.end()) {
+            c->prefix_checkpoint_ids.push_back(id);
+        }
+    }
+    while (c->prefix_checkpoint_ids.size() > (size_t)std::max(0, c->config.prefix_checkpoints)) {
+        c->prefix_checkpoint_ids.erase(c->prefix_checkpoint_ids.begin());
+    }
     if (c->compat_hash == 0) c->compat_hash = hdr.compat_hash;
     // Cache the metadata for downstream consumers (per-checkpoint
     // files inherit it; mismatched files will be rejected).
@@ -567,6 +581,8 @@ static bool forget_checkpoint_locked(kv_ssd_cache* c, uint64_t id) {
         c->warm_cache.erase(warm_it);
     }
     c->index.erase(ckpt_it);
+    auto & anchors = c->prefix_checkpoint_ids;
+    anchors.erase(std::remove(anchors.begin(), anchors.end(), id), anchors.end());
 
     for (auto latest_it = c->slot_latest.begin(); latest_it != c->slot_latest.end();) {
         if (latest_it->second != id) {
@@ -620,7 +636,12 @@ static void ring_buffer_evict(kv_ssd_cache* c) {
         }
     }
     std::sort(cold_by_age.begin(), cold_by_age.end(),
-        [](const auto& a, const auto& b) {
+        [c](const auto& a, const auto& b) {
+            const auto & anchors = c->prefix_checkpoint_ids;
+            const auto pa = std::find(anchors.begin(), anchors.end(), a.first);
+            const auto pb = std::find(anchors.begin(), anchors.end(), b.first);
+            if ((pa != anchors.end()) != (pb != anchors.end())) return pa == anchors.end();
+            if (pa != anchors.end() && pb != anchors.end()) return pa < pb;
             return a.second != b.second ? a.second < b.second : a.first < b.first;
         });
 
@@ -632,12 +653,13 @@ static void ring_buffer_evict(kv_ssd_cache* c) {
         if (ckpt_it == c->index.end()) continue;
 
         // Delete file from disk
-        delete_checkpoint_file(c, id);
+        if (!delete_checkpoint_file(c, id)) continue;
         forget_checkpoint_locked(c, id);
         evicted++;
     }
 
     if (evicted > 0) {
+        write_index_file(c);
         LOG_INF("SSD cache: ring buffer evicted %d checkpoints (limit=%d, remaining=%zu)\n",
                 evicted, max_cold, c->index.size());
     }
@@ -1027,6 +1049,9 @@ kv_ssd_cache* kv_ssd_init(const char* path, const kv_ssd_config* cfg, uint64_t c
 
     // Scan checkpoint files to rebuild in-memory index
     size_t loaded = scan_checkpoint_files(c);
+    auto & anchors = c->prefix_checkpoint_ids;
+    anchors.erase(std::remove_if(anchors.begin(), anchors.end(),
+        [c](uint64_t id) { return c->index.count(id) == 0; }), anchors.end());
     for (const auto& [id, checkpoint] : c->index) {
         (void)checkpoint;
         c->next_id = std::max(c->next_id, id + 1);
@@ -1082,7 +1107,8 @@ kv_ssd_store_plan kv_ssd_plan_store(
     size_t tokens_size,
     uint64_t compat_hash,
     bool has_dft_state,
-    bool has_spec_state) {
+    bool has_spec_state,
+    bool prefix_anchor) {
     kv_ssd_store_plan plan;
     if (!cache || !cache->initialized || !tokens || n_tokens == 0 || tokens_size < n_tokens) {
         return plan;
@@ -1168,6 +1194,11 @@ kv_ssd_store_plan kv_ssd_plan_store(
         return plan;
     }
 
+    // A new shared preamble must have its own exact recurrent boundary;
+    // ordinary growth/time suppression would discard it. Exact duplicates
+    // above still avoid serialization and writes.
+    if (prefix_anchor && cache->config.prefix_checkpoints > 0) return plan;
+
     const bool growth_enabled = cache->config.durable_min_growth_tokens > 0;
     const bool age_enabled = cache->config.durable_max_age_ms > 0;
     if (base_id == 0 || (!growth_enabled && !age_enabled)) {
@@ -1190,6 +1221,20 @@ kv_ssd_store_plan kv_ssd_plan_store(
         cache->slot_latest[slot_id] = base_id;
     }
     return plan;
+}
+
+void kv_ssd_mark_prefix(kv_ssd_cache* cache, uint64_t checkpoint_id) {
+    if (!cache || !cache->initialized || cache->config.prefix_checkpoints <= 0) return;
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    if (cache->index.count(checkpoint_id) == 0) return;
+    auto & anchors = cache->prefix_checkpoint_ids;
+    if (!anchors.empty() && anchors.back() == checkpoint_id) return;
+    anchors.erase(std::remove(anchors.begin(), anchors.end(), checkpoint_id), anchors.end());
+    anchors.push_back(checkpoint_id);
+    while (anchors.size() > (size_t)std::min(cache->config.prefix_checkpoints, 3)) {
+        anchors.erase(anchors.begin());
+    }
+    write_index_file(cache);
 }
 
 uint64_t kv_ssd_store(kv_ssd_cache* cache,
@@ -1510,16 +1555,19 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
             continue;
         }
 
-        // Prefer full matches over partial matches, then highest LCP,
-        // then most recent turn, then more tokens.
+        // Full hashes verify the complete saved prefix, not just the first
+        // 4096 indexed tokens. Prefer the longest reusable state before age;
+        // otherwise a recent short shared anchor masks a much longer match.
         int score = (hash_match && size_ok) ? 2 : 1;
         int best_score = best_full ? 2 : 1;
+        const uint64_t reusable = score == 2 ? ckpt.n_tokens : (uint64_t)lcp;
+        const uint64_t best_reusable = best_full ? best_n_tokens : (uint64_t)best_lcp;
 
         if (best_id == 0 ||
             score > best_score ||
-            (score == best_score && lcp > best_lcp) ||
-            (score == best_score && lcp == best_lcp && ckpt.turn_created > best_turn) ||
-            (score == best_score && lcp == best_lcp && ckpt.turn_created == best_turn && ckpt.n_tokens > best_n_tokens)) {
+            (score == best_score && reusable > best_reusable) ||
+            (score == best_score && reusable == best_reusable && ckpt.turn_created > best_turn) ||
+            (score == best_score && reusable == best_reusable && ckpt.turn_created == best_turn && id > best_id)) {
             best_full = (hash_match && size_ok);
             best_turn = ckpt.turn_created;
             best_n_tokens = ckpt.n_tokens;
@@ -1539,6 +1587,15 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
     }
     if (best_id != 0 && out_lcp)     *out_lcp = best_lcp;
     if (best_id != 0 && out_partial) *out_partial = !best_full;
+
+    // Refresh only the small retention hint, not the large checkpoint file.
+    auto & anchors = cache->prefix_checkpoint_ids;
+    const auto anchor = std::find(anchors.begin(), anchors.end(), best_id);
+    if (anchor != anchors.end() && std::next(anchor) != anchors.end()) {
+        anchors.erase(anchor);
+        anchors.push_back(best_id);
+        write_index_file(cache);
+    }
 
     return best_id;
 }
@@ -1687,6 +1744,7 @@ size_t kv_ssd_enforce_size_cap(
         int64_t modified_order = 0;
         bool user_scoped = false;
         bool protected_newest = false;
+        bool prefix_anchor = false;
     };
 
     auto is_hex_key = [](const std::string& name) {
@@ -1722,6 +1780,15 @@ size_t kv_ssd_enforce_size_cap(
             uint64_t cache_key = 0;
             if (sscanf(dir_name.c_str(), "%016" SCNx64, &cache_key) != 1) continue;
 
+            // Index hints cover unloaded namespaces too. Invalid/missing
+            // hints merely lose retention preference, never state validity.
+            kv_ssd_index_header hdr = {};
+            int index_fd = open((dirs->path() / "index.bin").string().c_str(), O_RDONLY);
+            const bool hints_valid = index_fd >= 0 && pread_all(index_fd, &hdr, sizeof(hdr), 0) &&
+                hdr.magic == KV_SSD_MAGIC_INDEX && hdr.version == KV_SSD_VERSION &&
+                hdr.header_checksum != 0 && validate_checksum(hdr, "retention index");
+            if (index_fd >= 0) close(index_fd);
+
             std::error_code file_ec;
             fs::directory_iterator entries(dirs->path(), file_ec);
             for (; !file_ec && entries != end; entries.increment(file_ec)) {
@@ -1738,7 +1805,10 @@ size_t kv_ssd_enforce_size_cap(
                     (int64_t)modified.time_since_epoch().count();
                 const size_t file_size = (size_t) raw_size;
                 files.push_back({ entries->path(), cache_key, checkpoint_id,
-                                  file_size, modified_order, user_scoped, false });
+                                  file_size, modified_order, user_scoped, false,
+                                  hints_valid && std::find(std::begin(hdr.prefix_checkpoint_ids),
+                                      std::end(hdr.prefix_checkpoint_ids), checkpoint_id) !=
+                                      std::end(hdr.prefix_checkpoint_ids) });
                 total = file_size > SIZE_MAX - total ? SIZE_MAX : total + file_size;
             }
         }
@@ -1803,6 +1873,10 @@ size_t kv_ssd_enforce_size_cap(
     }
     std::sort(oldest_conversations.begin(), oldest_conversations.end(), older_first);
     candidates.insert(candidates.end(), oldest_conversations.begin(), oldest_conversations.end());
+    // Prefer shared anchors after ordinary branch checkpoints. They remain
+    // eligible victims when necessary to meet the global disk budget.
+    std::stable_partition(candidates.begin(), candidates.end(),
+        [&](size_t i) { return !files[i].prefix_anchor; });
 
     for (size_t index : candidates) {
         if (total <= max_bytes) break;

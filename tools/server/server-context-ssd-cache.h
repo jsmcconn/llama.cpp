@@ -44,7 +44,8 @@ public:
                                  const common_prompt_checkpoint& ckpt,
                                  const llama_token* tokens,
                                  size_t tokens_size,
-                                 uint32_t turn_id);
+                                 uint32_t turn_id,
+                                 bool prefix_anchor = false);
 
     // Load a checkpoint by ID. Restores via llama_state_seq_set_data_ext.
     // ctx_dft receives the MTP/draft context state if it was stored (may be nullptr).

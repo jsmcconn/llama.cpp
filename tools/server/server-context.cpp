@@ -1566,6 +1566,7 @@ private:
                              params_base.cache_ssd_warm_ram_mib == 0);
             cfg.hot_window_tokens = params_base.cache_ssd_hot_window_tokens;
             cfg.max_cold_checkpoints = params_base.cache_ssd_max_cold;
+            cfg.prefix_checkpoints = params_base.cache_ssd_prefix_checkpoints;
             cfg.hot_turns = 2;
             cfg.warm_turns = 4;
             cfg.durable_min_growth_tokens = (size_t)params_base.cache_ssd_durable_min_growth;
@@ -3000,6 +3001,15 @@ private:
         const int64_t checkpoint_n_tokens = cur.n_tokens;
         const int64_t task_n_tokens = slot.task ? slot.task->n_tokens() : 0;
         const int64_t remaining_tokens = task_n_tokens - checkpoint_n_tokens;
+        // The first user boundary is shared by fresh sessions with identical
+        // system/tool preambles. A later recurrent snapshot cannot rewind to
+        // this boundary. Persist useful (>= 1024 token) anchors even near the
+        // final prompt, using the normal full target + draft + spec SSD state.
+        const bool prefix_anchor = params_base.cache_ssd_prefix_checkpoints > 0 &&
+            slot.task && checkpoint_n_tokens >= 1024 &&
+            checkpoint_n_tokens == slot.task->params.message_spans.first_user_message_pos() &&
+            pos_max == checkpoint_n_tokens - 1 &&
+            (!ctx_dft || llama_memory_seq_pos_max(llama_get_memory(ctx_dft.get()), slot.id) == pos_max);
         const bool final_checkpoint_will_cover =
             slot.task &&
             slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
@@ -3007,14 +3017,14 @@ private:
             remaining_tokens >= 0 &&
             remaining_tokens <= llama_n_ubatch(ctx_tgt);
 
-        if (ssd_page_manager && !slot.prompt.tokens.has_media() && !final_checkpoint_will_cover) {
+        if (ssd_page_manager && !slot.prompt.tokens.has_media() && (!final_checkpoint_will_cover || prefix_anchor)) {
             const auto & prefix_tokens = slot.prompt.tokens;
             ssd_page_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur,
                 prefix_tokens.get_tokens().data(),
                 prefix_tokens.get_tokens().size(),
                 ssd_turn_counter, slot.conv_hash,
-                slot.task ? slot.task->user_id : std::string());
+                slot.task ? slot.task->user_id : std::string(), prefix_anchor);
         } else if (ssd_page_manager && !slot.prompt.tokens.has_media() && final_checkpoint_will_cover) {
             SLT_INF(slot,
                     "SSD cache: keeping near-end mid-prompt checkpoint in RAM "
@@ -4138,6 +4148,42 @@ private:
                         int n_past = 0;
                         SLT_DBG(slot, "[PROBE] prefill-init n_past=0 slot.prompt=%zu ssd_page_manager=%d cache_prompt=%d\n",
                                 slot.prompt.tokens.size(), (int)(ssd_page_manager != nullptr), (int)slot.task->params.cache_prompt);
+
+                        // A shared owner may return to a longer conversation
+                        // while this slot holds only another session's preamble.
+                        // Compare exact reusable RAM boundaries with SSD before
+                        // committing to prefill. Keep RAM for small differences:
+                        // deserializing full target + draft state has a real cost.
+                        if (ssd_page_manager && params_base.cache_ssd_prefix_checkpoints > 0 &&
+                                slot.task->params.cache_prompt && slot.prompt.n_tokens() > 0 &&
+                                !slot.prompt.tokens.has_media() && !input_tokens.has_media() &&
+                                server_context_has_recurrent_state(ctx_tgt) &&
+                                !slot.task->user_id.empty() && slot.user_id_ == slot.task->user_id &&
+                                slot.alora_invocation_start < 0) {
+                            const int64_t lcp = slot.prompt.tokens.get_common_prefix(input_tokens);
+                            int64_t reusable = 0;
+                            const auto pos = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                            const auto draft_pos = ctx_dft
+                                ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft.get()), slot.id) : pos;
+                            if (pos >= 0 && pos + 1 <= lcp && pos + 1 < slot.task->n_tokens() && pos == draft_pos) {
+                                reusable = pos + 1;
+                            }
+                            for (const auto & checkpoint : slot.prompt.checkpoints) {
+                                if (checkpoint.can_resume_recurrent(lcp, slot.task->n_tokens()) &&
+                                        !checkpoint.data_tgt.empty() && (!ctx_dft || !checkpoint.data_dft.empty())) {
+                                    reusable = std::max(reusable, checkpoint.n_tokens);
+                                }
+                            }
+                            const auto & tokens = input_tokens.get_tokens();
+                            if (ssd_page_manager->has_better_checkpoint(tokens.data(), tokens.size(),
+                                    ssd_turn_counter, slot.task->user_id, reusable + 1024, ctx_dft != nullptr)) {
+                                SLT_INF(slot, "SSD cache: upgrading warm prefix (%" PRId64 " reusable tokens)\n", reusable);
+                                // Preserve the assigned task/owner. On a failed
+                                // disk load the normal cold path safely prefills.
+                                slot.mem.seq_rm(slot.id, -1, -1);
+                                slot.prompt.clear();
+                            }
+                        }
 
                         // cold start: try per-conversation SSD checkpoint restore
                         // Must populate slot.prompt.tokens so get_common_prefix() finds the match

@@ -188,6 +188,20 @@ static bool test_exact_extent_can_be_excluded_for_recurrent_state() {
 int main() {
     int failures = 0;
 
+    {
+        const auto path = std::filesystem::temp_directory_path() / "test-ssd-cache-longest";
+        auto * cache = create_cache(path);
+        std::vector<uint32_t> tokens(16000, 42);
+        const std::array<uint8_t, 1> state = {0};
+        const auto longer = kv_ssd_store(cache, 0, state.data(), state.size(), 0, 11999,
+                                        12000, 1, tokens.data(), tokens.size());
+        kv_ssd_store(cache, 0, state.data(), state.size(), 0, 4999,
+                     5000, 2, tokens.data(), tokens.size());
+        assert(kv_ssd_find_match(cache, tokens.data(), tokens.size(), 3, 15999,
+                                -1, nullptr, nullptr, false) == longer);
+        destroy_cache(cache, path);
+    }
+
     if (!test_partial_prefix_is_bounded()) {
         fprintf(stderr, "partial prefix match was not bounded to the verified prefix\n");
         failures++;

@@ -1774,6 +1774,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
    ).set_env("LLAMA_ARG_CACHE_SSD_MAX_COLD").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-ssd-prefix-checkpoints"}, "N",
+        "prefer retaining N shared system/tool-prefix checkpoints within SSD caps (0..3, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 3) {
+                throw std::invalid_argument("invalid value for --cache-ssd-prefix-checkpoints: must be 0..3");
+            }
+            params.cache_ssd_prefix_checkpoints = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_PREFIX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-ssd-hot-ram", "--cache-ssd-hot-ram"}, "N",
         string_format("hot tier RAM budget in MiB for SSD cache (default: auto-size, 0=auto)"),
         [](common_params & params, int value) {

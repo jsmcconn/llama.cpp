@@ -331,6 +331,85 @@ static void test_global_cap_counts_disk_and_preserves_newest() {
     fs::remove_all(scratch);
 }
 
+static void test_prefix_retention_and_restart() {
+    kv_ssd_config cfg;
+    cfg.auto_size = false;
+    cfg.hot_ram_bytes = 1;
+    cfg.warm_ram_bytes = 1;
+    cfg.max_cold_checkpoints = 4;
+    cfg.prefix_checkpoints = 3;
+    cfg.durable_min_growth_tokens = 4096;
+    const auto scratch = make_scratch("prefix-retention");
+    auto * c = kv_ssd_init(scratch.string().c_str(), &cfg, 0xA11, "u/");
+    std::vector<uint32_t> tokens(8192, 11);
+    const std::vector<uint8_t> state(64, 0x5a);
+    auto save = [&](size_t n, uint32_t turn) {
+        return kv_ssd_store(c, 0, state.data(), state.size(), 0, n - 1, n,
+                            turn, tokens.data(), tokens.size());
+    };
+    const auto anchor = save(4096, 1);
+    kv_ssd_mark_prefix(c, anchor);
+    // A distinct useful preamble needs its own exact boundary even though
+    // it falls inside the normal durable growth cadence.
+    assert(kv_ssd_plan_store(c, 0, 0, 4195, 4196, 2, tokens.data(), tokens.size(),
+        0, false, false).action == KV_SSD_STORE_SKIP_CADENCE);
+    assert(kv_ssd_plan_store(c, 0, 0, 4195, 4196, 2, tokens.data(), tokens.size(),
+        0, false, false, true).action == KV_SSD_STORE_WRITE);
+    assert(kv_ssd_plan_store(c, 0, 0, 4095, 4096, 2, tokens.data(), tokens.size(),
+        0, false, false, true).action == KV_SSD_STORE_REUSE);
+    for (uint32_t turn = 2; turn <= 12; ++turn) save(5000 + turn, turn);
+    kv_ssd_on_turn_complete(c, 20);
+    assert(c->index.size() == 4);
+    assert(c->index.count(anchor) == 1);
+    assert(c->hot_bytes == 0 && c->warm_bytes == 0);
+    const auto directory = c->model_dir;
+    kv_ssd_free(c);
+    c = kv_ssd_init(scratch.string().c_str(), &cfg, 0xA11, "u/");
+    assert(c->prefix_checkpoint_ids == std::vector<uint64_t>{anchor});
+    std::vector<uint8_t> restored;
+    assert(kv_ssd_load(c, anchor, restored) && restored == state);
+    kv_ssd_free(c);
+    // The global cap honors hints from an unloaded namespace but can spill
+    // anchors too. No in-memory metadata is available to this operation.
+    const size_t file_size = fs::file_size(fs::path(directory) / "ckpt-1.bin");
+    assert(kv_ssd_enforce_size_cap(scratch.string().c_str(), file_size * 2) == file_size * 2);
+    assert(fs::exists(fs::path(directory) / "ckpt-1.bin"));
+    assert(kv_ssd_enforce_size_cap(scratch.string().c_str(), file_size) == file_size);
+    assert(!fs::exists(fs::path(directory) / "ckpt-1.bin"));
+    c = kv_ssd_init(scratch.string().c_str(), &cfg, 0xA11, "u/");
+    assert(c->prefix_checkpoint_ids.empty()); // stale hints are harmless
+    kv_ssd_free(c);
+    fs::remove_all(scratch);
+}
+
+static void test_prefix_retention_is_bounded() {
+    kv_ssd_config cfg;
+    cfg.auto_size = false;
+    cfg.hot_ram_bytes = 1;
+    cfg.warm_ram_bytes = 1;
+    cfg.prefix_checkpoints = 3;
+    cfg.max_cold_checkpoints = 2;
+    const auto scratch = make_scratch("prefix-bound");
+    auto * c = kv_ssd_init(scratch.string().c_str(), &cfg, 0xA12);
+    const std::vector<uint8_t> state(64, 1);
+    const std::vector<uint32_t> tokens(4096, 11);
+    for (uint32_t turn = 1; turn <= 4; ++turn) {
+        auto id = kv_ssd_store(c, 0, state.data(), state.size(), 0, 4095, 4096,
+                              turn, tokens.data(), tokens.size());
+        kv_ssd_mark_prefix(c, id);
+    }
+    assert((c->prefix_checkpoint_ids == std::vector<uint64_t>{2, 3, 4}));
+    kv_ssd_mark_prefix(c, 2); // most recently used anchor survives a smaller cap
+    kv_ssd_on_turn_complete(c, 20);
+    assert(c->index.size() == 2 && c->index.count(2) && c->index.count(4));
+    kv_ssd_free(c);
+    cfg.prefix_checkpoints = 0;
+    c = kv_ssd_init(scratch.string().c_str(), &cfg, 0xA12);
+    assert(c->prefix_checkpoint_ids.empty());
+    kv_ssd_free(c);
+    fs::remove_all(scratch);
+}
+
 int main(void) {
     printf("test-ssd-cache-caps: regression suite for issue #6\n");
     printf("====================================================\n\n");
@@ -341,6 +420,8 @@ int main(void) {
     RUN(durable_plan_and_duplicate_suppression);
     RUN(oversized_checkpoint_stays_cold);
     RUN(global_cap_counts_disk_and_preserves_newest);
+    RUN(prefix_retention_and_restart);
+    RUN(prefix_retention_is_bounded);
 
     printf("\n====================================================\n");
     printf("Ran %d tests, %d failed\n", tests_run, tests_failed);

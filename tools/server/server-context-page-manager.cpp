@@ -263,7 +263,8 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
     size_t tokens_size,
     uint32_t turn_id,
     uint64_t conv_hash,
-    const std::string& user_id
+    const std::string& user_id,
+    bool prefix_anchor
 ) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
 
@@ -280,7 +281,7 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
     // is the critical placement for long contexts: a skipped 262K checkpoint
     // avoids both a ~10 GiB host allocation/copy and the SSD write.
     const kv_ssd_store_plan plan = sc->plan_store(
-        slot_id, ctx_dft, ckpt, tokens, tokens_size, turn_id);
+        slot_id, ctx_dft, ckpt, tokens, tokens_size, turn_id, prefix_anchor);
     if (plan.action == KV_SSD_STORE_SKIP_CADENCE) {
         LOG_INF("SSD cache: durable write deferred slot=%u tokens=%lu base=%lu growth=%lu age=%lu ms\n",
                 slot_id, (unsigned long)ckpt.n_tokens,
@@ -312,6 +313,7 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
         ? plan.checkpoint_id
         : sc->store(slot_id, ctx, ctx_dft, ckpt, tokens, tokens_size, turn_id);
     if (ckpt_id == 0) return false;
+    if (prefix_anchor) kv_ssd_mark_prefix(sc->get_cache(), ckpt_id);
     if (plan.action == KV_SSD_STORE_REUSE) {
         LOG_INF("SSD cache: reused exact durable checkpoint %lu slot=%u tokens=%lu\n",
                 (unsigned long)ckpt_id, slot_id, (unsigned long)ckpt.n_tokens);
@@ -539,6 +541,25 @@ bool server_context_page_manager::find_matching_checkpoint(
 
     cache_misses_++;
     return false;
+}
+
+bool server_context_page_manager::has_better_checkpoint(
+    const llama_token* tokens, size_t tokens_size,
+    uint32_t current_turn, const std::string& user_id,
+    uint64_t min_n_tokens, bool has_draft) {
+    if (user_id.empty() || tokens_size <= 1 || min_n_tokens >= tokens_size) return false;
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    const auto it = user_wrappers_.find(sha256_namespace_key(user_id));
+    if (it == user_wrappers_.end()) return false;
+    auto * sc = it->second.get();
+    const uint64_t id = sc->find_match(tokens, tokens_size, current_turn,
+        tokens_size - 1, -1, nullptr, nullptr, /* allow_partial = */ false);
+    kv_ssd_checkpoint meta;
+    return id != 0 && kv_ssd_get_meta(sc->get_cache(), id, meta) &&
+        meta.n_tokens >= min_n_tokens && meta.pos_max >= 0 &&
+        meta.n_tokens == (uint64_t)meta.pos_max + 1 &&
+        (meta.dft_data_size > 0) == has_draft &&
+        (!has_draft || meta.spec_data_size > 0);
 }
 
 bool server_context_page_manager::find_and_load_checkpoint(

@@ -74,7 +74,8 @@ public:
         size_t tokens_size,
         uint32_t turn_id,
         uint64_t conv_hash = 0,
-        const std::string& user_id = std::string()
+        const std::string& user_id = std::string(),
+        bool prefix_anchor = false
     );
 
     // Load a checkpoint back to slot memory
@@ -134,6 +135,12 @@ public:
     // across all conversation directories if conv_hash isn't known yet.
     // dest_seq_id: current slot's seq_id — KV cells are restored under this id so that
     // llama_memory_seq_pos_min() returns a valid value for the slot after restore.
+    // Metadata probe for a warm recurrent slot. Never deserializes, creates a
+    // namespace, or crosses owners; matching may refresh retention hints.
+    bool has_better_checkpoint(const llama_token* tokens, size_t tokens_size,
+        uint32_t current_turn, const std::string& user_id,
+        uint64_t min_n_tokens, bool has_draft);
+
     bool find_and_load_checkpoint(
         const llama_token* tokens,
         size_t tokens_size,

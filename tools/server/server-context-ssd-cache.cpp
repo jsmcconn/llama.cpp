@@ -18,11 +18,12 @@ kv_ssd_store_plan server_ssd_cache::plan_store(
     const common_prompt_checkpoint& ckpt,
     const llama_token* tokens,
     size_t tokens_size,
-    uint32_t turn_id) {
+    uint32_t turn_id,
+    bool prefix_anchor) {
     return kv_ssd_plan_store(
         cache_, slot_id, ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, turn_id,
         (const uint32_t*)tokens, tokens_size, cache_ ? cache_->compat_hash : 0,
-        ctx_dft != nullptr, !ckpt.data_spec.empty());
+        ctx_dft != nullptr, !ckpt.data_spec.empty(), prefix_anchor);
 }
 
 uint64_t server_ssd_cache::store(uint32_t slot_id,

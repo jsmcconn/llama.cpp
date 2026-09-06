@@ -33,6 +33,7 @@ struct kv_ssd_config {
     size_t hot_window_tokens = 4096; // Recent tokens always kept hot
     bool auto_size           = true;
     int max_cold_checkpoints = 32;  // Max checkpoints per model (ring buffer cap)
+    int prefix_checkpoints  = 0;   // Prefer retaining up to 3 shared-prefix anchors within existing caps
     float memory_reserve     = 0.15f;
     // Size of the loaded model in bytes. The auto-size path uses this
     // to subtract the model's footprint from MemAvailable before
@@ -130,7 +131,9 @@ struct kv_ssd_index_header {
                                     // for future per-cache metadata)
     uint64_t header_checksum;       // FNV-1a over the prior header
                                     // bytes; detects on-disk corruption
-    uint64_t reserved[3];           // Future use
+    // Formerly reserved in v4. Optional retention hints, oldest -> newest.
+    // They do not change checkpoint validity; older v4 readers ignore them.
+    uint64_t prefix_checkpoint_ids[3];
 };
 
 // Maximum tokens stored per checkpoint for prefix matching
@@ -190,6 +193,7 @@ public:
 
     // Checkpoint index: id -> metadata
     std::unordered_map<uint64_t, kv_ssd_checkpoint> index;
+    std::vector<uint64_t> prefix_checkpoint_ids; // bounded retention hints, oldest -> newest
 
     // RAM caches: id -> checkpoint data
     std::unordered_map<uint64_t, std::vector<uint8_t>> hot_cache;
@@ -264,7 +268,12 @@ kv_ssd_store_plan kv_ssd_plan_store(
     size_t tokens_size,
     uint64_t compat_hash,
     bool has_dft_state,
-    bool has_spec_state);
+    bool has_spec_state,
+    bool prefix_anchor = false);
+
+// Prefer retaining an existing checkpoint as a shared-prefix anchor. Hints
+// survive restart in the v4 index, but never override cold-count/disk caps.
+void kv_ssd_mark_prefix(kv_ssd_cache* cache, uint64_t checkpoint_id);
 
 // Load a checkpoint by ID. Reads ckpt-{id}.bin and promotes to hot tier.
 // out_dft_data and out_spec_data receive the optional extra blobs if non-null.
