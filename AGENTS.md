@@ -266,11 +266,11 @@ models: add Laguna-S-2.1 support (decoder_arch = "laguna")
 ## Development Tools
 
 ```bash
-# Build
-cmake -B build && cmake --build build -j$(nproc)
-
-# Test
-cd build && ctest --output-on-failure
+# Always use: cd ~/llama-ai && ./scripts/rebuild.sh --clean
+# (the script sets up and uses ccache correctly and builds quickly;
+#  the plain `cmake -B build && cmake --build build` path misses ccache
+#  on minimal distros. Tests can be enabled afterwards via a second
+#  `cmake -DLLAMA_BUILD_TESTS=ON` invocation in the build dir.)
 
 # Server
 ./build/bin/llama-server -m model.gguf

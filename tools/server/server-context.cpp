@@ -1879,19 +1879,6 @@ private:
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
                 const int common_prefix = tokens.get_common_prefix(task.tokens);
 
-                // Stable-prefix gate: if the caller told us how many leading
-                // tokens form a stable prefix (system prompt + thread_summary),
-                // reject any slot whose stored prompt does not share that
-                // prefix. This lets CLIO keep summary positions byte-identical
-                // across turns so the LCP match survives a context trim.
-                // Legacy behavior (prompt_stable_prefix_tokens == 0): no gate.
-                if (task.params.prompt_stable_prefix_tokens > 0 &&
-                    common_prefix < task.params.prompt_stable_prefix_tokens) {
-                    SLT_DBG(slot, "LCP match rejected: common_prefix=%d < stable_prefix=%d\n",
-                            common_prefix, task.params.prompt_stable_prefix_tokens);
-                    continue;
-                }
-
                 const float sim_cur = float(common_prefix) / task.tokens.size();
 
                 // select the current slot if the criteria match
@@ -1917,19 +1904,18 @@ private:
                 // When llama_user_id is present and matches the slot owner,
                 // and conv_hash matches (same first 1024 tokens), session
                 // continuity is already established via user_id + conv_hash.
-                // CLIO's prompt architecture has a large stable prefix
-                // (prompt_stable_prefix_tokens, ~29K tokens: system prompt +
-                // CSSS summary + context files) plus a large variable suffix
-                // (~58K tokens: dialog + tool_results). The LCP match correctly
-                // identifies the stable prefix, but f_keep drops below 0.5
-                // because the variable suffix dominates the prompt size.
-                // Applying the LCP heuristic here fires a false-positive
-                // boundary, clearing the KV cache and triggering a double-clear
-                // (prompt_clear in get_available_slot + prompt_clear again in
+                // CLIO's prompt architecture: role-based XML trim, no CSSS.
+                // The LCP match identifies the system-prompt prefix (~29K
+                // tokens) plus any unchanged role blocks. f_keep can drop
+                // below 0.5 because the variable suffix (dialog +
+                // tool_results) dominates the prompt size. Applying the LCP
+                // heuristic here fires a false-positive boundary, clearing
+                // the KV cache and triggering a double-clear (prompt_clear
+                // in get_available_slot + prompt_clear again in
                 // launch_slot_with_task via needs_session_reset flag). This
                 // wipes the partial KV cache restore from prompt_load(),
-                // forcing the entire ~89K-token prompt to be reprocessed every
-                // turn instead of just the ~60K new tokens.
+                // forcing the entire prompt to be reprocessed every turn
+                // instead of just the new tokens.
                 //
                 // Only apply LCP-based boundary detection for anonymous
                 // requests (no user_id) or when user_id doesn't match
@@ -1947,9 +1933,8 @@ private:
                         session_reset = session_reset || (f_keep < 0.5f && sim_best < 0.95f);
                     } else {
                         SLT_DBG(*ret, "session continuity preserved (user_id match + conv_hash=0x%016lx match), "
-                                "skipping LCP boundary detection (f_keep=%.3f, sim_best=%.3f, stable_prefix=%d)\n",
-                                (unsigned long)task_conv_hash, f_keep, sim_best,
-                                task.params.prompt_stable_prefix_tokens);
+                                "skipping LCP boundary detection (f_keep=%.3f, sim_best=%.3f)\n",
+                                (unsigned long)task_conv_hash, f_keep, sim_best);
                     }
                     // Redact raw user_ids in the INFO log; emit short
                     // SHA-256 prefixes for correlation only.
@@ -1967,13 +1952,8 @@ private:
                 }
 
                 if (task.id_slot == -1) {
-                    if (task.params.prompt_stable_prefix_tokens > 0) {
-                        SLT_INF(*ret, "selected slot by LCP similarity (stable prefix=%d), sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                                task.params.prompt_stable_prefix_tokens, sim_best, slot_prompt_similarity, f_keep);
-                    } else {
-                        SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                                sim_best, slot_prompt_similarity, f_keep);
-                    }
+                    SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
+                            sim_best, slot_prompt_similarity, f_keep);
                 }
 
                 // if we are about to lose any portion of the existing context - save it in the prompt cache
@@ -1983,56 +1963,6 @@ private:
                 // loss from an agent trim), leaving cold starts without a useful entry.
                 if (f_keep < 1.0f) {
                     update_cache = true;
-                }
-
-                // Slot-shrink guard: when the LCP matches the entire new task
-                // (sim_best >= 0.999, i.e. the new prompt is a strict prefix of
-                // the slot's stored prompt) but the slot has substantially more
-                // tokens beyond the LCP, the conversation has been trimmed by
-                // the client (e.g. CLIO's auto-shrink on a long session). The
-                // slot's KV cache and recurrent R/S state for positions beyond
-                // the LCP are about to be seq_rm'd, but the model attends to
-                // positions 0..n_past with state inherited from the prior
-                // conversation's run on those tokens. On hybrid MoE/SSM models
-                // (qwen35moe, qwen4exp, etc.) the recurrent state at the LCP
-                // boundary comes from processing the OLD conversation's flow,
-                // not a fresh run on the new conversation's flow, and the
-                // forced-bootstrap token (1 token when LCP == task.n_tokens)
-                // does not update the recurrent state enough to recover.
-                // Symptom: model generates unrelated training-corpus snippets
-                // (Chinese SQL, court opinions, Stack Overflow answers) in
-                // reasoning_content with empty content. Fires regardless of
-                // user_id/conv_hash match (same_session gate above is bypassed
-                // by this guard because it is a state-integrity bug, not a
-                // conversation-boundary bug). Force session_reset so the
-                // existing prompt_clear() path drops the slot's KV cache
-                // and the next launch_slot_with_task does a fresh prefill.
-                //
-                // Threshold: only fire when the shrink is substantial (> 64
-                // tokens). Tiny shrinks (1-2 tokens from a trailing newline
-                // or whitespace tweak) are not worth a 60+ second re-prefill.
-                if (!session_reset) {
-                    const int slot_tokens = ret->prompt.tokens.size();
-                    const int task_tokens = (int) task.tokens.size();
-                    const int common_prefix = ret->prompt.tokens.get_common_prefix(task.tokens);
-                    // sim_best == 1.0 exactly only when the new task is a strict
-                    // prefix of the slot. >= 0.999 catches float-edge cases
-                    // where the division is one ULP short of 1.0.
-                    if (sim_best >= 0.999f && task_tokens < slot_tokens &&
-                        common_prefix == task_tokens &&
-                        slot_tokens - task_tokens > 64) {
-                        SLT_WRN(*ret, "slot-shrink guard: forcing session_reset "
-                                "(slot_tokens=%d, task_tokens=%d, common_prefix=%d, "
-                                "f_keep=%.3f, sim_best=%.3f). The new prompt is a "
-                                "strict prefix of the slot's stored prompt; the "
-                                "slot's recurrent R/S state beyond the LCP "
-                                "boundary is from the prior conversation's run "
-                                "and will corrupt the hybrid model's generation. "
-                                "Forcing prompt_clear() to drop the slot and do a "
-                                "fresh prefill on the next launch_slot_with_task.\n",
-                                slot_tokens, task_tokens, common_prefix, f_keep, sim_best);
-                        session_reset = true;
-                    }
                 }
             }
         }
@@ -2158,23 +2088,6 @@ private:
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
-            }
-
-            // Session boundary / slot-shrink guard: when session_reset was set
-            // (by conv_hash mismatch, low f_keep, or our slot-shrink guard
-            // above) and we did NOT run the cache update (n_parallel <= 1
-            // path or cache disabled), still drop the slot's KV cache and
-            // prompt tokens so launch_slot_with_task does a fresh prefill.
-            // Without this, n_parallel=1 sessions skip prompt_clear() entirely
-            // and the slot is reused with the stale state intact.
-            //
-            // Note: needs_session_reset is set so launch_slot_with_task can
-            // skip its own redundant prompt_clear().
-            if (session_reset && ret->prompt.tokens.size() > 0) {
-                SLT_INF(*ret, "session_reset outside cache update: clearing stale KV cache (conv_hash slot=0x%016lx task=0x%016lx, slot_tokens=%zu)\n",
-                        (unsigned long)ret->conv_hash, (unsigned long)task_conv_hash, ret->prompt.tokens.size());
-                ret->prompt_clear();
-                ret->needs_session_reset = true;
             }
 
             // Per-user concurrency accounting: only count tasks that bind
@@ -4646,7 +4559,42 @@ private:
                                             if (n_swa > 0 && cur.pos_max > pos_next) {
                                                 return false;
                                             }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                            // Deferred-final snapshots (pos_min=0, pos_max=prompt_end)
+                                            // capture the full recurrent + attention state for
+                                            // [0, pos_max). They were added upstream in
+                                            // ggml-org#21510 for SWA models (Gemma 4) where
+                                            // a small LCP needs to load them. For CachyLLama
+                                            // (role-based XML trim, no CSSS) a pos_min=0
+                                            // snapshot is only valid for the exact prompt that
+                                            // produced it.
+                                            //
+                                            // On WARM slots for hybrid MoE/SSM models
+                                            // (qwen35moe with full_attention_interval=4,
+                                            // qwen4exp), the recurrent R/S state at positions
+                                            // 0..LCP-1 was computed during the OLD
+                                            // conversation's full token flow. Even though
+                                            // the tokens at 0..LCP-1 are identical, the
+                                            // recurrent boundary state was shaped by the old
+                                            // conversation's suffix (the trimmed context that
+                                            // no longer exists). Loading a stale deferred-final
+                                            // puts non-recurrent-consistent state at the BCP
+                                            // boundary, corrupting generation.
+                                            //
+                                            // Only accept a deferred-final on a warm slot when
+                                            // n_past covers the entire checkpoint extent
+                                            // (pos_next >= cur.pos_max), meaning the LCP is
+                                            // an exact match and no boundary token was
+                                            // truncated. Cold starts (ssd_cold_start_used)
+                                            // always accept because the slot was cleared.
+                                            if (cur.pos_min == 0 && !slot.ssd_cold_start_used &&
+                                                pos_next < cur.pos_max) {
+                                                SLT_DBG(slot, "deferred-final rejected on warm slot "
+                                                        "(pos_min=0, pos_max=%d, pos_next=%d, ssd_cold=%d) "
+                                                        "- recurrent state stale beyond LCP boundary\n",
+                                                        (int)cur.pos_max, (int)pos_next, (int)slot.ssd_cold_start_used);
+                                                return false;
+                                            }
+                                            return cur.pos_min < pos_min_thold;
                                         }
                                     );
 
