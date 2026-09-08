@@ -279,6 +279,7 @@ struct server_slot {
     bool truncated      = false;
     bool deferred_final_checkpoint = false;  // create final checkpoint after first token
     bool ssd_cold_start_used       = false;  // SSD cache restored for this slot on cold start
+    bool checkpoint_restored_on_hybrid = false;  // in-memory checkpoint restored on hybrid model; needs attn-only truncation
     uint64_t conv_hash             = 0;      // consistent conversation hash for all checkpoints
     bool   needs_session_reset     = false;  // set by get_available_slot, checked by launch_slot_with_task
     std::string user_id_;                        // identity of the owning task (for scheduling/affinity)
@@ -383,6 +384,8 @@ struct server_slot {
         truncated      = false;
         deferred_final_checkpoint = false;
         ssd_cold_start_used       = false;
+        checkpoint_restored_on_hybrid = false;
+        checkpoint_restored_on_hybrid = false;
         // NOTE: conv_hash is intentionally NOT reset here. It is preserved
         // across tasks so that launch_slot_with_task can detect conversation
         // boundaries (new agent sessions) by comparing the previous conv_hash
@@ -4616,7 +4619,7 @@ private:
                                         // after restoring a checkpoint, the recurrent state positions
                                         // may not align with token indices on hybrid models (MoE/SSM).
                                         // use seq_rm_attn_only instead of full seq_rm to avoid crash
-                                        slot.ssd_cold_start_used = true;
+                                        slot.checkpoint_restored_on_hybrid = true;
                                     }
 
                                     if (do_reset) {
@@ -4709,7 +4712,7 @@ private:
                                             for (int32_t i = 0; i < recovered_n_sys; i++) {
                                                 slot.prompt.tokens.push_back(task_tokens[i]);
                                             }
-                                            slot.ssd_cold_start_used = true;
+                                            slot.checkpoint_restored_on_hybrid = true;
                                             SLT_DBG(slot, "[PROBE] sys-cache-fallback n_past=%d (n_sys=%d) after do_reset\n",
                                                     n_past, recovered_n_sys);
                                         } else {
@@ -4800,7 +4803,8 @@ private:
                     // past n_past (e.g., previous turn's generation tokens beyond
                     // LCP). the seq_rm_attn_only path handles both caches safely.
                     // See: https://github.com/fewtarius/llama-ai/issues/8
-                    if (!slot.ssd_cold_start_used) {
+                    const bool needs_attn_only_truncation = slot.ssd_cold_start_used || slot.checkpoint_restored_on_hybrid;
+                    if (!needs_attn_only_truncation) {
                         const llama_pos p0 = slot.prompt.tokens.pos_next();
 
                         SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
@@ -4822,7 +4826,8 @@ private:
                         // still report the stale value, and llama_batch_init
                         // validation fails on the next batch. See issue #8.
                         const llama_pos p0 = slot.prompt.tokens.pos_next();
-                        SLT_DBG(slot, "SSD used, seq_rm_attn_only [%d, end)\n", p0);
+                        SLT_DBG(slot, "%s used, seq_rm_attn_only [%d, end)\n",
+                                slot.ssd_cold_start_used ? "SSD" : "checkpoint", p0);
                         auto * mem = llama_get_memory(ctx_tgt);
                         if (mem) {
                             llama_memory_seq_rm_attn_only(mem, slot.id, p0, -1);
