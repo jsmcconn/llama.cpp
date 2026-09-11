@@ -247,3 +247,137 @@ Chat template and parser:
 - [PEG parser](docs/development/parsing.md) - alternative to regex that llama.cpp uses to parse model's output
 - [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
 - [Jinja engine](common/jinja/README.md)
+
+## Common Patterns
+
+### Environment variables
+
+| Prefix | Purpose |
+|--------|---------|
+| `GGML_VK_*` | Vulkan backend tuning (shaders, scratch, nodes_per_submit) |
+| `GGML_VK_DISABLE_*` | Opt-out flags for individual Vulkan features |
+| `LLAMA_ARG_*` | CLI flag equivalents for MoE residency offload |
+| `LLAMA_SSD_*` | SSD cache configuration (defaults, not overrides) |
+
+User overrides (that win over the solver in `llama-run.sh` in the parent project) use `*_OVERRIDE` suffix or are passed via CLI flags.
+
+### Memory and storage guarantees
+
+CachyLLama makes different kinds of claims about its optimizations, and they have different levels of support. Use this three-way distinction when documenting or troubleshooting.
+
+**Things CachyLLama actually guarantees:**
+
+- An expert in the R+F cache was selected by the R+F algorithm as a good candidate to keep resident.
+- A checkpoint on disk has the on-disk format we wrote (atomic write succeeded).
+- An explicit `user_id` never matches another `user_id`'s checkpoints (namespace hash is per-user).
+
+**Things requested from the OS but not guaranteed:**
+
+- That `MADV_WILLNEED` actually caused pages to be paged in. The kernel may already have them resident (so the call is a no-op), or may ignore the hint.
+- That `MADV_COLD` actually caused the kernel to evict the page. The kernel decides under memory pressure.
+- That the working set fits in physical RAM. We *try* to keep it there, but a competing workload can evict our pages regardless.
+
+**Things observed on a particular machine:**
+
+- The `policy_hit_rate` reported in the per-decode log — the LRU+R+F prediction accuracy. The number is correct but the implication ("the kernel kept our pages") is not.
+- The aggregate residency ratio from `--moe-residency-debug` — the actual physical residency, measured via `mincore()`. This is the ground truth, but it is specific to the workload, hardware, and competing memory pressure at the time of measurement.
+
+### Verifying residency is doing what it claims
+
+Run the model with `--moe-residency-debug` (Linux only). The per-decode log line shows `policy_hit_rate` and the per-debug-interval line shows the `aggregate ... ratio` (real physical residency). The two should track each other within a few percent on hardware without competing memory pressure. If `policy_hit_rate` is high but `aggregate ratio` is low, the kernel is evicting pages we asked it to keep and the policy is not doing anything. If `advice_einval` in the per-decode summary is non-zero, the kernel is rejecting the `madvise()` advice outright and the policy is definitely not doing anything.
+
+### Verifying SSD cache is doing what it claims
+
+Check that the `kv-ssd` on-disk directory uses the expected `conv_hash` or SHA-256 `user_id` prefix (not a raw `user_id`). For atomic-write guarantees, kill the server with `kill -9` mid-checkpoint-write and verify that the prior valid index is recoverable on next startup. The `tests/test-kv-ssd-user-isolation` binary exercises both properties without needing a real model.
+
+### Independently disabling optimizations
+
+Each CachyLLama-specific optimization can be disabled in isolation so a regression can be bisected to a single cause. The flags:
+
+- `--no-moe-expert-residency` — disables the MoE expert madvise layer. Tracking remains on; the R+F cache and the touch path are skipped.
+- `--cache-ssd` / `--no-cache-ssd` — enables or disables the SSD checkpoint cache. The default is "auto" (enabled when the model is large enough to benefit).
+- `--no-mmap` — implicit: requires `--no-moe-expert-residency` because the madvise layer operates on the mmap'd model file.
+- `LLAMA_ARG_NO_FSYNC=1` — skips the fsync on checkpoint writes for lower write latency at the cost of losing the last checkpoint on crash. Use only for benchmarking, not production.
+- `GGML_VK_NODES_PER_SUBMIT=N` — Vulkan command-buffer batching. The APU default is 8; discrete GPU default is 100. Override when debugging a specific backend issue.
+
+If a workload regresses, the developer should be able to disable exactly one optimization and see the regression go away. If two optimizations share a flag, file a bug — the dependency should be broken.
+
+---
+
+## Maintenance Routines
+
+These are recurring tasks performed periodically to keep CachyLLama's divergence from upstream manageable. When starting a session, check if any are due.
+
+### Upstream merge
+
+CachyLLama merges upstream `llama.cpp` master periodically via `git merge upstream/master`. Before merging:
+
+1. Push to a backup branch: `git branch backup-before-rebase`
+2. After the merge, re-check all CachyLLama carries for conflicts — especially `ggml/src/ggml-vulkan/ggml-vulkan.cpp` (which accumulates shader dispatch additions) and `src/llama-arch.cpp` / `src/llama-model.cpp` (which gain per-model architecture entries)
+3. The `patches/` directory in the parent project is deprecated — CachyLLama maintains its changes directly in git history
+
+### Patch-set status re-validation
+
+Each upstream merge can change which carries are still needed. Re-check [docs/patch-set-status.md](docs/patch-set-status.md) and:
+
+- For "Merged upstream" rows: drop the local copy on the next merge, rebase local additions onto the upstream version.
+- For "Not upstreamed" rows: keep carrying; verify the upstream status hasn't changed.
+- For "Upstream added" rows: rebase CachyLLama tuning/gating onto the upstream version when the differences are small enough.
+
+**Watch upstream #24127** (CUDA MMQ refactor) — it added `static_assert((I_) % 32 == 0)` to the CASE macro, so any new `rdna3_5` config must keep `I` as a multiple of 32.
+
+### Adding a new model
+
+1. Add architecture entries in `src/llama-arch.cpp` and `src/llama-arch.h`
+2. Implement `src/models/{model}.cpp` following the pattern in [docs/development/HOWTO-add-model.md](docs/development/HOWTO-add-model.md)
+3. Add GGUF metadata keys in `src/llama-model.cpp` if the model has custom hparams
+4. Update `convert_hf_to_gguf.py` if the model needs conversion support
+5. Run `test-backend-ops` to verify operator consistency
+
+### Adding a new Vulkan shader
+
+1. Add the `.comp` file in `ggml/src/ggml-vulkan/vulkan-shaders/`
+2. Register it in `ggml/src/ggml-vulkan/vulkan-shaders/CMakeLists.txt`
+3. Add dispatch logic in `ggml/src/ggml-vulkan/ggml-vulkan.cpp`
+4. Gate behind an env var (`GGML_VK_DISABLE_*` or `GGML_VK_*`)
+5. Run `test-backend-ops` to verify correctness
+
+### CachyLLama-specific API additions
+
+New public C API functions go in `include/llama.h` (after the upstream API section) and `src/llama.cpp`. Follow the existing `LLAMA_API` visibility convention. Document with inline comments that describe what, not why — git history handles why.
+
+---
+
+## Anti-Patterns
+
+| Anti-pattern | Why it's wrong | What to do |
+|--------------|----------------|------------|
+| Adding third-party dependencies | Project minimizes deps intentionally | Use vendored libs in `vendor/` or implement inline |
+| Using `typedef struct foo {} foo` | Project convention is `struct foo {}` | Declare as `struct foo {}` |
+| Fancy template metaprogramming | Codebase avoids complex STL constructs | Use basic loops and simple patterns |
+| Mixing unrelated changes in one commit | History should be scannable | One logical change per commit |
+| Ignoring clang-format | Project has strict formatting rules | Run `clang-format`, respect `.editorconfig` |
+| Committing handoff files | Session notes are internal | Keep `ai-assisted/` out of git |
+| Writing `Assisted-by:` in commits | Fork history is our own | Use descriptive commit messages |
+| Hardcoding line numbers in docs | Code shifts, docs go stale | Reference function/struct names, not line numbers |
+
+---
+
+## Key Documentation
+
+| File | Purpose |
+|------|---------|
+| `README.md` | Project overview, CLI flags, benchmarks |
+| `docs/build.md` | Build instructions for all platforms/backends (upstream) |
+| `docs/development/HOWTO-add-model.md` | Adding new model support |
+| `docs/development/parsing.md` | PEG parser for model output |
+| `docs/development/user-isolation-design.md` | User isolation architecture (`user_id` / `u/` namespace / `--max-concurrent-per-user`) |
+| `docs/moe-expert-residency.md` | MoE expert residency mechanism, hit rates, C API |
+| `docs/autoparser.md` | Auto-detecting model features (upstream) |
+| `docs/ops.md` | ggml operator reference (upstream) |
+| `docs/ops/Vulkan.csv` | Vulkan op support matrix (upstream) |
+| `docs/vulkan-init-order.md` | Vulkan feature-flag init-order constraint (Lightning Indexer, DSV4_HC) |
+| `docs/context-checkpoints.md` | Server context checkpoint ring buffer (LCP / f_keep) |
+| `docs/patch-set-status.md` | Third-party carries and upstream status |
+
+---

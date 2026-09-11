@@ -324,6 +324,7 @@ struct server_slot {
     bool truncated      = false;
     bool deferred_final_checkpoint = false;  // create final checkpoint after first token
     bool ssd_cold_start_used       = false;  // SSD cache restored for this slot on cold start
+    bool checkpoint_restored_on_hybrid = false;  // in-memory checkpoint restored on hybrid model; needs attn-only truncation
     uint64_t conv_hash             = 0;      // consistent conversation hash for all checkpoints
     bool   needs_session_reset     = false;  // set by get_available_slot, checked by launch_slot_with_task
     std::string user_id_;                        // identity of the owning task (for scheduling/affinity)
@@ -428,6 +429,8 @@ struct server_slot {
         truncated      = false;
         deferred_final_checkpoint = false;
         ssd_cold_start_used       = false;
+        checkpoint_restored_on_hybrid = false;
+        checkpoint_restored_on_hybrid = false;
         // NOTE: conv_hash is intentionally NOT reset here. It is preserved
         // across tasks so that launch_slot_with_task can detect conversation
         // boundaries (new agent sessions) by comparing the previous conv_hash
@@ -1922,18 +1925,7 @@ private:
                 }
 
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
-                // Stable-prefix gate: if the caller told us how many leading
-                // tokens form a stable prefix (system prompt + thread_summary),
-                // reject any slot whose stored prompt does not share that
-                // prefix. This lets CLIO keep summary positions byte-identical
-                // across turns so the LCP match survives a context trim.
-                // Legacy behavior (prompt_stable_prefix_tokens == 0): no gate.
-                if (task.params.prompt_stable_prefix_tokens > 0 &&
-                    common_prefix < task.params.prompt_stable_prefix_tokens) {
-                    SLT_DBG(slot, "LCP match rejected: common_prefix=%d < stable_prefix=%d\n",
-                            common_prefix, task.params.prompt_stable_prefix_tokens);
-                    continue;
-                }
+
 
                 const float sim_cur = float(common_prefix) / task.tokens.size();
 
@@ -1960,19 +1952,18 @@ private:
                 // When llama_user_id is present and matches the slot owner,
                 // and conv_hash matches (same system/first-user prefix), session
                 // continuity is already established via user_id + conv_hash.
-                // CLIO's prompt architecture has a large stable prefix
-                // (prompt_stable_prefix_tokens, ~29K tokens: system prompt +
-                // CSSS summary + context files) plus a large variable suffix
-                // (~58K tokens: dialog + tool_results). The LCP match correctly
-                // identifies the stable prefix, but f_keep drops below 0.5
-                // because the variable suffix dominates the prompt size.
-                // Applying the LCP heuristic here fires a false-positive
-                // boundary, clearing the KV cache and triggering a double-clear
-                // (prompt_clear in get_available_slot + prompt_clear again in
+                // CLIO's prompt architecture: role-based XML trim, no CSSS.
+                // The LCP match identifies the system-prompt prefix (~29K
+                // tokens) plus any unchanged role blocks. f_keep can drop
+                // below 0.5 because the variable suffix (dialog +
+                // tool_results) dominates the prompt size. Applying the LCP
+                // heuristic here fires a false-positive boundary, clearing
+                // the KV cache and triggering a double-clear (prompt_clear
+                // in get_available_slot + prompt_clear again in
                 // launch_slot_with_task via needs_session_reset flag). This
                 // wipes the partial KV cache restore from prompt_load(),
-                // forcing the entire ~89K-token prompt to be reprocessed every
-                // turn instead of just the ~60K new tokens.
+                // forcing the entire prompt to be reprocessed every turn
+                // instead of just the new tokens.
                 //
                 // Only apply LCP-based boundary detection for anonymous
                 // requests (no user_id) or when user_id doesn't match
@@ -1996,9 +1987,8 @@ private:
                         session_reset = session_reset || (f_keep < 0.5f && sim_best < 0.95f);
                     } else {
                         SLT_DBG(*ret, "session continuity preserved (user_id match + conv_hash=0x%016lx match), "
-                                "skipping LCP boundary detection (f_keep=%.3f, sim_best=%.3f, stable_prefix=%d)\n",
-                                (unsigned long)task_conv_hash, f_keep, sim_best,
-                                task.params.prompt_stable_prefix_tokens);
+                                "skipping LCP boundary detection (f_keep=%.3f, sim_best=%.3f)\n",
+                                (unsigned long)task_conv_hash, f_keep, sim_best);
                     }
                     // Redact raw user_ids in the INFO log; emit short
                     // SHA-256 prefixes for correlation only.
@@ -2016,13 +2006,8 @@ private:
                 }
 
                 if (task.id_slot == -1) {
-                    if (task.params.prompt_stable_prefix_tokens > 0) {
-                        SLT_INF(*ret, "selected slot by LCP similarity (stable prefix=%d), sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                                task.params.prompt_stable_prefix_tokens, sim_best, slot_prompt_similarity, f_keep);
-                    } else {
-                        SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                                sim_best, slot_prompt_similarity, f_keep);
-                    }
+                    SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
+                            sim_best, slot_prompt_similarity, f_keep);
                 }
 
                 // if we are about to lose any portion of the existing context - save it in the prompt cache
@@ -4622,9 +4607,54 @@ private:
                                                     cur.can_resume_recurrent(n_past, slot.task->n_tokens()) &&
                                                     !cur.data_tgt.empty() && (!ctx_dft || !cur.data_dft.empty());
                                             }
-                                            // Workaround for [TAG_CHECKPOINTS_FIX_POS_MIN].
-                                            if (cur.pos_max > pos_next) return false;
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                            // Workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]:
+                                            // for SWA models, pos_min/pos_max can be incorrect
+                                            // so the saved state may not actually contain positions
+                                            // past pos_next. Exclude those checkpoints. For non-SWA
+                                            // (KV cache + bounded rec window like Qwen3.6 hybrid),
+                                            // pos_max is correct and the checkpoint fully covers
+                                            // [pos_min, pos_max] — the deferred-final pattern
+                                            // (pos_min=0, pos_max=prompt_end) is a valid snapshot
+                                            // at any LCP position <= pos_max.
+                                            if (n_swa > 0 && cur.pos_max > pos_next) {
+                                                return false;
+                                            }
+                                            // Deferred-final snapshots (pos_min=0, pos_max=prompt_end)
+                                            // capture the full recurrent + attention state for
+                                            // [0, pos_max). They were added upstream in
+                                            // ggml-org#21510 for SWA models (Gemma 4) where
+                                            // a small LCP needs to load them. For CachyLLama
+                                            // (role-based XML trim, no CSSS) a pos_min=0
+                                            // snapshot is only valid for the exact prompt that
+                                            // produced it.
+                                            //
+                                            // On WARM slots for hybrid MoE/SSM models
+                                            // (qwen35moe with full_attention_interval=4,
+                                            // qwen4exp), the recurrent R/S state at positions
+                                            // 0..LCP-1 was computed during the OLD
+                                            // conversation's full token flow. Even though
+                                            // the tokens at 0..LCP-1 are identical, the
+                                            // recurrent boundary state was shaped by the old
+                                            // conversation's suffix (the trimmed context that
+                                            // no longer exists). Loading a stale deferred-final
+                                            // puts non-recurrent-consistent state at the BCP
+                                            // boundary, corrupting generation.
+                                            //
+                                            // Only accept a deferred-final on a warm slot when
+                                            // n_past covers the entire checkpoint extent
+                                            // (pos_next >= cur.pos_max), meaning the LCP is
+                                            // an exact match and no boundary token was
+                                            // truncated. Cold starts (ssd_cold_start_used)
+                                            // always accept because the slot was cleared.
+                                            if (cur.pos_min == 0 && !slot.ssd_cold_start_used &&
+                                                pos_next < cur.pos_max) {
+                                                SLT_DBG(slot, "deferred-final rejected on warm slot "
+                                                        "(pos_min=0, pos_max=%d, pos_next=%d, ssd_cold=%d) "
+                                                        "- recurrent state stale beyond LCP boundary\n",
+                                                        (int)cur.pos_max, (int)pos_next, (int)slot.ssd_cold_start_used);
+                                                return false;
+                                            }
+                                            return cur.pos_min < pos_min_thold;
                                         }
                                     );
 
@@ -4650,7 +4680,6 @@ private:
 
                                         // The next decode begins strictly after the saved state.
                                         // Normal sequence removal is safe at this exact boundary.
-
                                     }
 
                                     if (do_reset) {
@@ -4744,7 +4773,7 @@ private:
                                             for (int32_t i = 0; i < recovered_n_sys; i++) {
                                                 slot.prompt.tokens.push_back(task_tokens[i]);
                                             }
-                                            slot.ssd_cold_start_used = true;
+                                            slot.checkpoint_restored_on_hybrid = true;
                                             SLT_DBG(slot, "[PROBE] sys-cache-fallback n_past=%d (n_sys=%d) after do_reset\n",
                                                     n_past, recovered_n_sys);
                                         } else {
@@ -4821,7 +4850,8 @@ private:
                     // past n_past (e.g., previous turn's generation tokens beyond
                     // LCP). the seq_rm_attn_only path handles both caches safely.
                     // See: https://github.com/fewtarius/llama-ai/issues/8
-                    if (!slot.ssd_cold_start_used) {
+                    const bool needs_attn_only_truncation = slot.ssd_cold_start_used || slot.checkpoint_restored_on_hybrid;
+                    if (!needs_attn_only_truncation) {
                         const llama_pos p0 = slot.prompt.tokens.pos_next();
 
                         SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
@@ -4843,7 +4873,8 @@ private:
                         // still report the stale value, and llama_batch_init
                         // validation fails on the next batch. See issue #8.
                         const llama_pos p0 = slot.prompt.tokens.pos_next();
-                        SLT_DBG(slot, "SSD used, seq_rm_attn_only [%d, end)\n", p0);
+                        SLT_DBG(slot, "%s used, seq_rm_attn_only [%d, end)\n",
+                                slot.ssd_cold_start_used ? "SSD" : "checkpoint", p0);
                         auto * mem = llama_get_memory(ctx_tgt);
                         if (mem) {
                             llama_memory_seq_rm_attn_only(mem, slot.id, p0, -1);

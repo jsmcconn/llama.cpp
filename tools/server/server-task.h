@@ -64,13 +64,6 @@ struct task_params {
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 
-    // Per-request: number of leading prompt tokens that form a stable
-    // prefix (system prompt + thread_summary). When set, the LCP matcher
-    // rejects any slot whose stored prompt does not share this prefix,
-    // so a CLIO trim that keeps system+summary byte-identical still
-    // produces a high-similarity match. 0 = disabled (legacy behavior).
-    int32_t prompt_stable_prefix_tokens = 0;
-
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
