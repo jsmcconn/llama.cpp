@@ -75,8 +75,12 @@
 
 namespace {
 
-// Mirror of the production predicate in server-context.cpp. If the
-// production code drifts, this test will start failing. That's intentional.
+// Hand-maintained mirror of the production predicate in server-context.cpp
+// (the acceptance lambda in the checkpoint search). The mirror is not linked to
+// production, so it pins the decision table, not the implementation: keep it in
+// lockstep by hand when the lambda changes. In production, recurrent/hybrid
+// targets return through the can_resume_recurrent arm before this predicate is
+// reached, so the cases below model the non-recurrent path.
 bool checkpoint_accepted(const common_prompt_checkpoint & cur,
                          int n_swa,
                          llama_pos pos_next,

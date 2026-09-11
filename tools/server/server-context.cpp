@@ -4661,6 +4661,9 @@ private:
                                             // an exact match and no boundary token was
                                             // truncated. Cold starts (ssd_cold_start_used)
                                             // always accept because the slot was cleared.
+                                            // Note: recurrent/hybrid targets return through the
+                                            // can_resume_recurrent arm above, which already requires an
+                                            // exact extent match; this guard covers the remaining models.
                                             if (cur.pos_min == 0 && !slot.ssd_cold_start_used &&
                                                 pos_next < cur.pos_max) {
                                                 SLT_DBG(slot, "deferred-final rejected on warm slot "
