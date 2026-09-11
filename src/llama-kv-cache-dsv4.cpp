@@ -1305,8 +1305,11 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
+    // keep indexer keys f16 regardless of type_k: the fused indexer kernels read
+    // f16 only, and quantizing this small cache (128 dims) saves little while
+    // forcing the much slower decomposed indexer path
     kv_lid = std::make_unique<llama_kv_cache>(
-            model, hparams_lid, type_k, type_v,
+            model, hparams_lid, GGML_TYPE_F16, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
@@ -1466,34 +1469,52 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return false;
         }
 
+
+        // Truncation semantics: drop cells with positions in [p0, +inf) so
+        // callers can set a new "current boundary" without rolling back past
+        // positions. The compressor state tensors (csa_state, hca_state,
+        // lid_state) are intentionally NOT rolled back: the model recovers
+        // any bounded drift during prefill of the divergent tokens starting
+        // at p0, mirroring the seq_rm_positions_only pattern in
+        // llama_memory_recurrent.
+        //
+        // The previous safety gate `p0 < kv_raw->seq_pos_min(seq_id)` was
+        // broken on DSV4: llama_kv_cache_dsv4::seq_pos_min intentionally
+        // returns kv_raw->seq_pos_max (so server-context cannot roll back
+        // via checkpoint search), which made cur_min == seq_pos_max and
+        // every in-range p0 fail the check. That kept this truncation path
+        // unreachable, so llama_memory_seq_rm_attn_only's fall-through to
+        // mem->seq_rm for the dsv4 mem type was a no-op. After an SSD or
+        // in-memory checkpoint restore, the stale kv_raw positions stayed
+        // in place and llama_decode flipped into the 'Invalid input batch'
+        // failure mode (issue #8 on DeepSeek-V4 / DSV4 models).
+        //
+        // For normal operation within the recurrent window (rollback <= n_rs_seq),
+        // we track the rollback in rs_idx for correct recurrent state handling.
+        // For checkpoint restores where rollback may exceed n_rs_seq, we allow
+        // the truncation to proceed without rs_idx update (the model recovers
+        // during prefill). llama_batch_init's "Y = X + 1" validation skips
+        // the check when seq_pos_max < 0, so leaving the cache empty after
+        // truncation is the intended outcome for a checkpoint-restore where
+        // the slot's logical position is past the loaded SWA window.
+
         const llama_pos pos_max = kv_raw->seq_pos_max(seq_id);
-        if (p0 > pos_max) {
-            bool res = true;
-
-            res = res & kv_raw->seq_rm(seq_id, p0, -1);
-            res = res & kv_csa->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
-            res = res & kv_hca->seq_rm(seq_id, p0/DSV4_HCA_RATIO, -1);
-            res = res & kv_lid->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
-
-            return res;
-        }
-
-        if (n_rs_seq == 0) {
-            return false;
-        }
-
-        const llama_pos rollback = pos_max - (p0 - 1);
-        if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
-            return false;
-        }
+        const llama_pos rollback = (pos_max >= p0) ? (pos_max - (p0 - 1)) : 0;
+        const bool within_rs_window = (n_rs_seq > 0 && rollback > 0 && rollback <= (llama_pos)n_rs_seq);
 
         // pending rollback is single-use: stacked partial removals don't compose
-        if (rs_idx[seq_id] != 0) {
+        if (within_rs_window && rs_idx[seq_id] != 0) {
             return false;
         }
 
-        const bool res = kv_raw->seq_rm(seq_id, p0, p1);
-        if (res) {
+        bool res = true;
+
+        res = res & kv_raw->seq_rm(seq_id, p0, -1);
+        res = res & kv_csa->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
+        res = res & kv_hca->seq_rm(seq_id, p0/DSV4_HCA_RATIO, -1);
+        res = res & kv_lid->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
+
+        if (within_rs_window) {
             rs_idx[seq_id] = (uint32_t) rollback;
         }
 
@@ -1653,7 +1674,7 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     kv_raw->state_read(io, seq_id, flags);
 
     if (!partial_only) {
-        clear_compressed(seq_id, true);
+        clear_compressed(seq_id, flags);
 
         dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);

@@ -27,7 +27,15 @@ private:
     // note: kept as a member so that cleanup_pending_task() can also reach them
     std::deque<server_task> queue_tasks_unhandled;
 
-    std::mutex mutex_tasks;
+public:
+    // mutable so const server_context_impl methods (e.g. is_user_at_cap)
+    // can lock it for read-side cap checks. locking is the synchronization
+    // point; this is the standard 'mutable mutex' idiom. made public
+    // because the cap check is defined on server_context_impl, outside
+    // this class.
+    mutable std::mutex mutex_tasks;
+
+private:
     std::condition_variable condition_tasks;
 
     // used by yield_to_queue, all fields are guarded by mutex_tasks

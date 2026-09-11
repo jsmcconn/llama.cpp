@@ -340,6 +340,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // target for a draft head that declares nextn_shared_target_tensors; must outlive this model
+        const struct llama_model * model_shared;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -659,7 +662,11 @@ extern "C" {
     // Returns true if the model is recurrent (like Mamba, RWKV, etc.)
     LLAMA_API bool llama_model_is_recurrent(const struct llama_model * model);
 
-    // Returns true if the model is hybrid (like Jamba, Granite, etc.)
+
+    // Returns true if the model uses multi-head latent attention (MLA) with compressed KV cache
+    LLAMA_API bool llama_model_is_mla(const struct llama_model * model);
+
+   // Returns true if the model is hybrid (like Jamba, Granite, etc.)
     LLAMA_API bool llama_model_is_hybrid(const struct llama_model * model);
 
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
@@ -746,6 +753,16 @@ extern "C" {
     // p0 < 0     : [0,  p1]
     // p1 < 0     : [p0, inf)
     LLAMA_API bool llama_memory_seq_rm(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Remove attention-only tokens from the specified sequence [p0, p1)
+    // For hybrid models, this clears KV cache entries without affecting recurrent state.
+    // For non-hybrid models, this is equivalent to llama_memory_seq_rm.
+    // Returns true if successful, false if the operation is not supported.
+    LLAMA_API bool llama_memory_seq_rm_attn_only(
             llama_memory_t mem,
               llama_seq_id seq_id,
                  llama_pos p0,
@@ -1597,6 +1614,146 @@ extern "C" {
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
+
+    //
+    // MoE expert tracking
+    //
+    // Track which experts are activated per layer during inference.
+    // This is used for expert tiering: hot experts stay in VRAM,
+    // cold experts can be offloaded to RAM/SSD.
+
+    // Per-layer expert activation statistics
+    struct llama_expert_stats {
+        int32_t n_expert;       // number of experts in this layer
+        int32_t n_expert_used;  // number of experts used per token
+        uint64_t total_tokens;  // total tokens processed
+        uint64_t * activation_count; // [n_expert] activation counts (owned by llama_context)
+    };
+
+    // Enable/disable expert activation tracking.
+    // Disabled by default. Enabling adds minimal overhead per decode.
+    LLAMA_API void llama_expert_tracking_enable(struct llama_context * ctx, bool enable);
+
+    // Check if expert tracking is enabled
+    LLAMA_API bool llama_expert_tracking_enabled(const struct llama_context * ctx);
+
+    // Get the number of experts per layer (0 if not an MoE model)
+    LLAMA_API int32_t llama_model_n_expert(const struct llama_model * model);
+
+    // Get the number of experts used per token (0 if not an MoE model)
+    LLAMA_API int32_t llama_model_n_expert_used(const struct llama_model * model);
+
+    // Get expert activation statistics for a specific layer.
+    // Returns 0 on success, -1 if tracking is disabled or layer is out of range.
+    // The caller must NOT free activation_count - it points into internal state.
+    LLAMA_API int32_t llama_expert_stats_get(
+            const struct llama_context * ctx,
+            int32_t layer,
+            struct llama_expert_stats * stats);
+
+    // Reset all expert activation statistics to zero.
+    LLAMA_API void llama_expert_stats_reset(struct llama_context * ctx);
+
+    // Per-layer snapshot of the expert IDs selected in the most recent decode.
+    // Filled by track_expert_activations() after each decode when tracking is enabled.
+    // Used by the MoE expert offload subsystem to pre-load the experts that
+    // will likely fire next (temporal locality in autoregressive generation).
+    struct llama_expert_last_selection {
+        int32_t n_expert_used;       // experts selected per token (= model n_expert_used)
+        int32_t n_tokens;            // number of tokens in the last decode batch
+        // [n_tokens * n_expert_used] row-major: selected[t * n_expert_used + e]
+        // Owned by llama_context. Do not free. Valid until the next decode().
+        const int32_t * selected;
+    };
+
+    // Get the most recent per-token expert selection for a layer.
+    // Returns 0 on success, -1 if tracking is disabled, not an MoE model, or
+    // layer out of range.
+    LLAMA_API int32_t llama_expert_last_selected_get(
+            const struct llama_context * ctx,
+            int32_t layer,
+            struct llama_expert_last_selection * selection);
+
+    // Clear the most recent expert selection snapshot (forces re-warm on next decode).
+    LLAMA_API void llama_expert_last_selected_clear(struct llama_context * ctx);
+
+    // Set the source model path. Used by the MoE residency subsystem to
+    // derive the co-activation persistence file location. Caller may pass
+    // an empty string to disable persistence.
+    LLAMA_API void llama_set_model_path(struct llama_context * ctx, const char * path);
+
+    //
+    // MoE expert residency (Phase 1, madvise-based)
+    //
+
+    // Public configuration for MoE expert residency management.
+    // All fields are POD for C compatibility; the implementation casts.
+    struct llama_moe_residency_config {
+        uint8_t enabled;                // master switch (0/1)
+        uint32_t max_resident_per_layer; // experts kept hot per layer (default 16)
+        uint8_t prewarm_on_init;        // prewarm at startup (0/1, default 1)
+        uint32_t prewarm_top_k;          // experts to prewarm if no stats (default 8)
+        uint8_t log_per_decode;         // log stats every N decodes (0/1, default 1)
+        // Linux-only. debug_sample_interval = 0 disables; positive
+        // values cause the residency layer to call mincore() on each
+        // tracked expert every N decodes and log the actual physical
+        // residency ratio. Use this to verify the software policy is
+        // actually changing which pages are resident.
+        uint32_t debug_sample_interval;  // default 0 (off)
+        uint32_t debug_max_pages;        // pages sampled per tensor (default 32)
+    };
+
+    // Return a config populated with sensible defaults.
+    LLAMA_API struct llama_moe_residency_config llama_moe_residency_config_default(void);
+
+    // Enable MoE expert residency management. When enabled, the context
+    // tracks which MoE experts fire per layer and uses madvise() to keep
+    // hot experts paged in while cold ones are evicted from RAM. This
+    // reduces physical memory pressure on the model. Requires the model to
+    // be loaded with mmap enabled (default). Tracking is also enabled.
+    //
+    // The state is built lazily on the next sched_reserve() (i.e. on the
+    // first decode). Returns 0 on success, -1 if the model is not MoE.
+    LLAMA_API int32_t llama_moe_residency_enable(
+            struct llama_context * ctx,
+            const struct llama_moe_residency_config * cfg);
+
+    // Disable MoE expert residency. Releases any pages marked WILLNEED.
+    LLAMA_API void llama_moe_residency_disable(struct llama_context * ctx);
+
+    // Stats snapshot. All counts are cumulative since enable().
+    struct llama_moe_residency_stats {
+        uint64_t total_hits;       // expert touches that were already loaded
+        uint64_t total_misses;     // expert touches that required MADV_WILLNEED
+        uint64_t total_evicted;    // experts removed from LRU via MADV_DONTNEED
+        uint64_t decode_count;     // total decode() calls observed
+        uint64_t moe_layer_count;  // number of MoE layers in the model
+        // madvise() observability. Distinguishes "policy hit" (the LRU
+        // thought the expert was loaded) from "kernel actually accepted
+        // our madvise() advice". advice_einval > 0 means the kernel
+        // rejected the advice for the mapping type - the policy is not
+        // doing anything. See src/llama-moe-residency.cpp.
+        uint64_t advice_success;     // madvise() returned 0
+        uint64_t advice_failure;     // madvise() returned -1 (any errno)
+        uint64_t advice_einval;      // subset of failures: errno == EINVAL
+        uint64_t invalid_mapping;    // calls skipped (null/len=0/unalignable)
+        // Whether MADV_COLD or another cold-path advice is being used on
+        // the eviction path. Kept here for observability, not for callers
+        // to branch on.
+        bool     uses_madv_cold;
+        // True if the residency layer tripped its madvise circuit
+        // breaker because the kernel returned ENOMEM. Once tripped, no
+        // further madvise() calls are issued for this context - the LRU
+        // still tracks expert usage, but the kernel manages the page
+        // cache on its own. This is the steady state on UMA APUs (Flip
+        // 7840U, Strix) where the model is mmap'd into VRAM+GTT and
+        // there is no headroom for advisory page-cache hints.
+        bool     madvise_disabled_due_to_pressure;
+    };
+
+    LLAMA_API void llama_moe_residency_stats_get(
+            const struct llama_context * ctx,
+            struct llama_moe_residency_stats * out);
 
     //
     // training

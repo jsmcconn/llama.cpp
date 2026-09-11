@@ -1401,6 +1401,23 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    // Wire MoE expert residency if enabled. The public API handles both
+    // eager build (if sched is already up) and deferred build (on next
+    // decode via sched_reserve).
+    if (params.moe_expert_residency) {
+        // Stash model path for coact persistence file location.
+        llama_set_model_path(lctx, params.model.path.c_str());
+        struct llama_moe_residency_config rcfg = llama_moe_residency_config_default();
+        rcfg.enabled                = 1;
+        rcfg.max_resident_per_layer = (uint32_t) params.moe_resident_per_layer;
+        rcfg.prewarm_on_init        = params.moe_residency_prewarm ? 1 : 0;
+        rcfg.prewarm_top_k          = (uint32_t) params.moe_residency_top_k;
+        rcfg.log_per_decode         = params.moe_residency_log ? 1 : 0;
+        rcfg.debug_sample_interval  = params.moe_residency_debug
+            ? params.moe_residency_debug_interval : 0;
+        llama_moe_residency_enable(lctx, &rcfg);
+    }
+
     pimpl->context.reset(lctx);
 
     set_process_priority(params.cpuparams.priority);
@@ -2269,6 +2286,11 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+}
+
+bool common_prompt_checkpoint::can_resume_recurrent(int64_t matched_tokens, int64_t prompt_tokens) const {
+    return n_tokens > 0 && n_tokens <= matched_tokens && n_tokens < prompt_tokens &&
+        pos_max >= 0 && (int64_t) pos_max + 1 == n_tokens;
 }
 
 void common_prompt_checkpoint::update_pos(

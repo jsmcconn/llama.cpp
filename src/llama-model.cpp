@@ -2512,7 +2512,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_QWEN4EXP);
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -2770,6 +2770,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.model_shared                =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
@@ -2815,6 +2816,10 @@ int32_t llama_model_n_layer(const llama_model * model) {
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
+}
+
+int32_t llama_model_n_expert_used(const llama_model * model) {
+    return model->hparams.n_expert_used();
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
@@ -3175,6 +3180,11 @@ llama_token llama_model_decoder_start_token(const llama_model * model) {
 
 bool llama_model_is_recurrent(const llama_model * model) {
     return llm_arch_is_recurrent(model->arch);
+}
+
+
+bool llama_model_is_mla(const llama_model * model) {
+    return model->hparams.is_mla();
 }
 
 bool llama_model_is_hybrid(const llama_model * model) {
