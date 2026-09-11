@@ -430,7 +430,6 @@ struct server_slot {
         deferred_final_checkpoint = false;
         ssd_cold_start_used       = false;
         checkpoint_restored_on_hybrid = false;
-        checkpoint_restored_on_hybrid = false;
         // NOTE: conv_hash is intentionally NOT reset here. It is preserved
         // across tasks so that launch_slot_with_task can detect conversation
         // boundaries (new agent sessions) by comparing the previous conv_hash
