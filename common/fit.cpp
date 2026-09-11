@@ -199,6 +199,38 @@ static void common_params_fit_impl(
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context that memory was measured at
 
+    // a shared draft export (nextn_shared_target_tensors) has no token_embd/output of its own and
+    // borrows them from the main model, so the main model must be alive while the extra model is
+    // measured. load it the way the measurements do: metadata only, no weights.
+    struct shared_model_guard {
+        llama_model * model = nullptr;
+        llama_model_params * mparams_extra = nullptr;
+
+        ~shared_model_guard() {
+            if (mparams_extra != nullptr) {
+                mparams_extra->model_shared = nullptr;
+            }
+            if (model != nullptr) {
+                llama_model_free(model);
+            }
+        }
+    } shared_model;
+
+    if (extra != nullptr && !extra->shares_model && extra->mparams->model_shared == nullptr) {
+        llama_model_params mparams_shared = *mparams;
+        mparams_shared.no_alloc  = true;
+        mparams_shared.load_mode = LLAMA_LOAD_MODE_NONE;
+
+        shared_model.model = llama_model_load_from_file(path_model, mparams_shared);
+        if (shared_model.model != nullptr) {
+            shared_model.mparams_extra = extra->mparams;
+            extra->mparams->model_shared = shared_model.model;
+        } else {
+            LOG_WRN("%s: failed to load '%s' to back the extra model, measuring it without a shared model\n",
+                    __func__, path_model);
+        }
+    }
+
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes
     auto add_extra_memory = [&](dmds_t & dmds) {
