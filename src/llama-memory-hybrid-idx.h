@@ -62,6 +62,15 @@ public:
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
+    // override seq_rm_attn_only to also clear the indexer cache cells in
+    // [p0, p1). the base llama_memory_hybrid::seq_rm_attn_only only touches
+    // mem_attn and mem_recr, which leaves the indexer desynced from the
+    // attention cache on qwen4exp (QSA) models. without this, save/load
+    // round-trips fail with "mirrored slot layout holds N cells, this cache
+    // restores M" because the indexer still has stale cells beyond the
+    // logical end of the restored state.
+    bool seq_rm_attn_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     // state write/load

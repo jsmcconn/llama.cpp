@@ -76,6 +76,12 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    // attention-only sequence removal for checkpoint restoration
+    // clears attention cache cells beyond p0 (regular seq_rm path), AND
+    // clears stale position tracking in the recurrent cache for the
+    // same range via seq_rm_positions_only (bypasses n_rs_seq rollback).
+    bool seq_rm_attn_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
     //
     // llama_memory_hybrid_iswa specific API
     //

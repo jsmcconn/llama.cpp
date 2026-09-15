@@ -184,6 +184,28 @@ llama_pos llama_memory_hybrid_iswa::seq_pos_max(llama_seq_id seq_id) const {
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
 }
 
+bool llama_memory_hybrid_iswa::seq_rm_attn_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // clears attention cache cells beyond p0 (regular seq_rm path), AND
+    // clears stale position tracking in the recurrent cache for the
+    // same range via seq_rm_positions_only.
+    //
+    // the recurrent R/S tensor data is intentionally preserved: full
+    // seq_rm on mem_recr would trigger the n_rs_seq rollback path and
+    // can fail (return false) for rollback amounts > n_rs_seq on
+    // mamba/GDN models. seq_rm_positions_only removes seq_id from cells
+    // past p0 without modifying cell.pos / rs_idx / tail, so it never
+    // enters the rollback path.
+    //
+    // this dual clear is required because hybrid seq_pos_max returns
+    // min(attn_pos_max, recr_pos_max). if we only clear attn but leave
+    // recr's stale positions intact, seq_pos_max still reports the
+    // stale value and llama_batch_init validation fails on the next
+    // batch (the bug fixed in https://github.com/fewtarius/llama-ai/issues/8).
+    const bool ok = mem_attn->seq_rm(seq_id, p0, p1);
+    mem_recr->seq_rm_positions_only(seq_id, p0, p1);
+    return ok;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown();
     for (const auto & buft_size : mem_recr->memory_breakdown()) {
