@@ -251,9 +251,16 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_update(llama_context * lctx, 
 }
 
 bool llama_kv_cache_iswa::get_can_shift() const {
+    // Shifting is supported when both sub-caches support it individually.
+    // The size-equality check (kv_base->get_size() == kv_swa->get_size())
+    // is intentionally removed: the SWA cache is typically much smaller than
+    // the base cache (e.g. 6144 vs 131072 cells), but seq_add/seq_rm are
+    // safe no-ops on the SWA cache when the shift range falls outside the
+    // SWA window. The base cache handles all positions beyond the SWA window,
+    // so chunk reuse (non-contiguous KV block matching) works correctly
+    // even with disparate cache sizes.
     return kv_base->get_can_shift() &&
-           kv_swa->get_can_shift() &&
-           kv_base->get_size() == kv_swa->get_size();
+           kv_swa->get_can_shift();
 }
 
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
